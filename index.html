@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Fusco Foods Pricing</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .tier-recipe { background:#ecfdf5; color:#047857; border-color:#a7f3d0; }
+  .tier-confirmed { background:#eff6ff; color:#1d4ed8; border-color:#bfdbfe; }
+  .tier-placeholder { background:#fffbeb; color:#92400e; border-color:#fde68a; }
+  .tab-btn.active { background:#0f172a; color:#fff; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+
+<div id="app" class="max-w-6xl mx-auto p-6"></div>
+
+<script>
+const SUPABASE_URL = "https://okpknfmjdqbtlwefblkn.supabase.co";
+const SUPABASE_KEY = "sb_publishable_CZW9g1QXxkccqZ5y3qMM4Q_pSQb6rGw";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+let state = {
+  tab: "pricing",
+  mode: "actual",
+  products: [],
+  customers: [],
+  materials: [],
+  productCode: null,
+  customerId: null,
+  testPrice: "",
+  testVolume: "",
+  basket: [],
+};
+
+function money(n) { return "\u20ac" + (Number(n) || 0).toFixed(2); }
+function money4(n) { return "\u20ac" + (Number(n) || 0).toFixed(4); }
+function pct(n) { return ((Number(n) || 0) * 100).toFixed(1) + "%"; }
+function el(id) { return document.getElementById(id); }
+
+async function loadAll() {
+  const [{ data: products }, { data: customers }, { data: materials }] = await Promise.all([
+    sb.from("products").select("*").order("code"),
+    sb.from("customers").select("*").order("name"),
+    sb.from("materials").select("*").order("code"),
+  ]);
+  state.products = products || [];
+  state.customers = customers || [];
+  state.materials = materials || [];
+  if (!state.productCode && state.products.length) state.productCode = state.products[0].code;
+  if (!state.customerId && state.customers.length) state.customerId = state.customers[0].id;
+}
+
+// ---------- cost calculation ----------
+async function costBuildUp(productCode) {
+  const product = state.products.find((p) => p.code === productCode);
+  if (!product) return null;
+  const site = product.site_id;
+
+  const { data: costs } = await sb.from("product_costs").select("*").eq("product_code", productCode);
+  const ingredientRow = (costs || []).find((c) => c.cost_type === "ingredient");
+  const packagingRow = (costs || []).find((c) => c.cost_type === "packaging");
+
+  async function tierValue(row, costType) {
+    if (!row) return { value: 0, tier: "placeholder", note: "No cost entered yet" };
+    if (row.tier === "recipe") {
+      const { data: lines } = await sb
+        .from("recipe_lines")
+        .select("quantity_per_batch, materials(cost_per_unit)")
+        .eq("product_code", productCode);
+      const total = (lines || []).reduce((s, l) => s + (l.quantity_per_batch || 0) * (l.materials?.cost_per_unit || 0), 0);
+      const withWastage = costType === "ingredient" ? total * (1 + (product.wastage_pct || 0)) : total;
+      return { value: withWastage, tier: "recipe", note: "From recipe" };
+    }
+    return { value: row.value || 0, tier: row.tier, note: row.tier === "confirmed" ? (row.source || "Confirmed") : `Estimated by ${row.entered_by || "?"} (${row.entered_at ? row.entered_at.slice(0, 10) : "?"})` };
+  }
+
+  const ingredient = await tierValue(ingredientRow, "ingredient");
+  const packaging = await tierValue(packagingRow, "packaging");
+
+  // labour + units produced (site-specific)
+  let labourValue = 0, unitsProduced = 0, labourNote = "No labour data yet";
+  if (site === "kilcoole") {
+    const { data: periods } = await sb
+      .from("kilcoole_labour_periods")
+      .select("*")
+      .eq("product_code", productCode)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (periods && periods.length) {
+      const p = periods[0];
+      unitsProduced = p.quantity_produced;
+      labourValue = p.total_labour_cost / p.quantity_produced;
+      labourNote = `${money(p.total_labour_cost)} \u00f7 ${p.quantity_produced} units (${p.period_label})`;
+    }
+  } else {
+    const [{ data: phases }, { data: outputRows }] = await Promise.all([
+      sb.from("stillorgan_labour_phases").select("*").eq("product_code", productCode),
+      sb.from("stillorgan_expected_output").select("*").eq("product_code", productCode).limit(1),
+    ]);
+    const output = outputRows && outputRows[0] ? outputRows[0].expected_output : 0;
+    if (phases && phases.length && output) {
+      const total = phases.reduce((s, ph) => s + ph.hours * ph.rate_per_hour, 0);
+      unitsProduced = output;
+      labourValue = total / output;
+      labourNote = phases.map((ph) => `${ph.phase_name} ${ph.hours}h\u00d7${money(ph.rate_per_hour)}`).join(" + ") + ` \u00f7 ${output} expected output`;
+    }
+  }
+
+  // overhead rates (mode-aware)
+  const { data: ohRows } = await sb.from("overhead_rates").select("*").eq("site_id", site).eq("mode", state.mode);
+  const oh = {};
+  (ohRows || []).forEach((r) => { oh[r.cost_type] = r.avg_monthly_units ? r.monthly_cost / r.avg_monthly_units : 0; });
+
+  // fixed overhead (day-based, real % split)
+  const { data: fixedRows } = await sb.from("fixed_costs").select("*");
+  let fixedAllocated = 0;
+  (fixedRows || []).forEach((r) => {
+    const sPct = r.stillorgan_pct ?? 0.5;
+    fixedAllocated += r.monthly_amount * (site === "stillorgan" ? sPct : (1 - sPct));
+  });
+  const { data: daysRow } = await sb.from("production_days_per_week").select("*").eq("site_id", site).single();
+  const daysPerMonth = (daysRow?.days || 5) * 52 / 12;
+  const dailyFixedRate = fixedAllocated / daysPerMonth;
+  const fixedOHPerUnit = unitsProduced ? dailyFixedRate / unitsProduced : 0;
+
+  // storage
+  const { data: storageSettings } = await sb.from("storage_settings").select("*").single();
+  const storageValue = product.storage_rate_override ?? storageSettings?.default_rate ?? 0;
+
+  const lines = [
+    { label: "Ingredient", value: ingredient.value, tier: ingredient.tier, note: ingredient.note },
+    { label: "Packaging", value: packaging.value, tier: packaging.tier, note: packaging.note },
+    { label: "Labour", value: labourValue, tier: "calculated", note: labourNote },
+    { label: "Electricity", value: oh.electricity || 0, tier: "overhead" },
+    { label: "Gas", value: oh.gas || 0, tier: "overhead" },
+    { label: "Cleaning", value: oh.cleaning || 0, tier: "overhead" },
+    { label: "Maintenance", value: oh.maintenance || 0, tier: "overhead" },
+    { label: "Fixed overhead", value: fixedOHPerUnit, tier: "overhead" },
+    { label: "Storage", value: storageValue, tier: "overhead" },
+  ];
+  const total = lines.reduce((s, l) => s + l.value, 0);
+  return { product, lines, total };
+}
+
+// ---------- rendering ----------
+function tierBadge(tier, note) {
+  if (tier === "calculated" || tier === "overhead") return "";
+  const cls = "tier-" + tier;
+  const label = tier === "recipe" ? "From recipe" : tier === "confirmed" ? "Confirmed" : "Estimated";
+  return `<span class="text-xs px-2 py-0.5 rounded border ${cls}" title="${note || ""}">${label}</span>`;
+}
+
+async function renderPricing() {
+  const container = el("app");
+  const product = state.products.find((p) => p.code === state.productCode);
+  const customer = state.customers.find((c) => c.id === state.customerId);
+  if (!product || !customer) {
+    container.innerHTML = renderShell(`<p class="text-sm text-slate-500">Add at least one product and one customer first (see the Products / Customers tabs).</p>`);
+    return;
+  }
+  const build = await costBuildUp(state.productCode);
+  const listPrice = product.selling_price || 0;
+  const netPrice = listPrice * (1 - customer.rebate_pct);
+  const contribution = netPrice - build.total - customer.delivery_rate;
+  const margin = netPrice ? contribution / netPrice : 0;
+
+  const priceUsed = state.testPrice ? parseFloat(state.testPrice) : listPrice;
+  const netAtTest = priceUsed * (1 - customer.rebate_pct);
+  const contribAtTest = netAtTest - build.total - customer.delivery_rate;
+  const marginAtTest = netAtTest ? contribAtTest / netAtTest : 0;
+  const volumeNum = parseFloat(state.testVolume) || 0;
+
+  const productOptions = state.products.map((p) => `<option value="${p.code}" ${p.code === state.productCode ? "selected" : ""}>${p.code} \u2014 ${p.description}</option>`).join("");
+  const customerOptions = state.customers.map((c) => `<option value="${c.id}" ${c.id === state.customerId ? "selected" : ""}>${c.name}</option>`).join("");
+
+  const costLines = build.lines.map((l) => `
+    <div class="flex items-center justify-between text-sm py-0.5">
+      <span class="flex items-center gap-2 text-slate-600">${l.label} ${tierBadge(l.tier, l.note)}</span>
+      <span class="tabular-nums">${money4(l.value)}</span>
+    </div>`).join("");
+
+  const basketRowsHtml = await renderBasketRows();
+
+  container.innerHTML = renderShell(`
+    <div class="grid grid-cols-2 gap-6">
+      <div class="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-slate-500">Product</label>
+            <select id="sel-product" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOptions}</select>
+          </div>
+          <div>
+            <label class="text-xs text-slate-500">Customer</label>
+            <select id="sel-customer" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm">${customerOptions}</select>
+          </div>
+        </div>
+        <p class="text-xs text-slate-500 capitalize">${product.site_id} \u00b7 mode: ${state.mode}</p>
+        <div class="border-t border-slate-100 pt-2">${costLines}
+          <div class="flex justify-between text-sm font-medium border-t border-slate-100 pt-1.5 mt-1">
+            <span>Total variable cost / unit</span><span class="tabular-nums">${money(build.total)}</span>
+          </div>
+        </div>
+        <div class="border-t border-slate-100 pt-2 space-y-1 text-sm">
+          <div class="flex justify-between"><span class="text-slate-600">List price</span><span>${money(listPrice)}</span></div>
+          <div class="flex justify-between"><span class="text-slate-600">Rebate</span><span>${pct(customer.rebate_pct)}</span></div>
+          <div class="flex justify-between"><span class="text-slate-600">Delivery</span><span>${money4(customer.delivery_rate)}</span></div>
+          <div class="flex justify-between font-medium"><span>Net price</span><span>${money(netPrice)}</span></div>
+          <div class="flex justify-between font-medium"><span>Contribution</span><span class="${contribution < 0 ? "text-red-600" : "text-emerald-600"}">${money(contribution)}</span></div>
+          <div class="flex justify-between font-medium"><span>Margin</span><span class="${margin < 0 ? "text-red-600" : "text-emerald-600"}">${pct(margin)}</span></div>
+        </div>
+        <button id="btn-add-basket" class="w-full text-sm bg-slate-900 text-white rounded-md py-2 hover:bg-slate-800">Add to quote basket</button>
+      </div>
+
+      <div class="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+        <h2 class="text-sm font-medium text-slate-700">Test a different price</h2>
+        <div class="grid grid-cols-2 gap-3">
+          <div><label class="text-xs text-slate-500">Test price</label>
+            <input id="in-test-price" type="number" step="0.01" value="${state.testPrice}" placeholder="${listPrice.toFixed(2)}" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+          <div><label class="text-xs text-slate-500">Test volume</label>
+            <input id="in-test-volume" type="number" value="${state.testVolume}" placeholder="0" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        </div>
+        <div class="space-y-1 text-sm">
+          <div class="flex justify-between"><span class="text-slate-600">Price used</span><span>${money(priceUsed)}</span></div>
+          <div class="flex justify-between"><span class="text-slate-600">Net price at test</span><span>${money(netAtTest)}</span></div>
+          <div class="flex justify-between font-medium"><span>Contribution / unit</span><span class="${contribAtTest < 0 ? "text-red-600" : "text-emerald-600"}">${money(contribAtTest)}</span></div>
+          <div class="flex justify-between font-medium"><span>Margin at test</span><span class="${marginAtTest < 0 ? "text-red-600" : "text-emerald-600"}">${pct(marginAtTest)}</span></div>
+          ${volumeNum > 0 ? `<div class="flex justify-between font-medium border-t border-slate-100 pt-1"><span>Total contribution at volume</span><span>${money(contribAtTest * volumeNum)}</span></div>` : ""}
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mt-6">
+      <h2 class="text-sm font-medium text-slate-700 mb-3">Quote basket</h2>
+      ${basketRowsHtml}
+    </div>
+  `);
+
+  el("sel-product").onchange = (e) => { state.productCode = e.target.value; renderPricing(); };
+  el("sel-customer").onchange = (e) => { state.customerId = e.target.value; renderPricing(); };
+  el("in-test-price").oninput = (e) => { state.testPrice = e.target.value; renderPricing(); };
+  el("in-test-volume").oninput = (e) => { state.testVolume = e.target.value; renderPricing(); };
+  el("btn-add-basket").onclick = () => {
+    state.basket.push({ id: Date.now(), productCode: state.productCode, customerId: state.customerId, quantity: 100, discount: 0 });
+    renderPricing();
+  };
+  document.querySelectorAll("[data-remove-basket]").forEach((b) => {
+    b.onclick = () => { state.basket = state.basket.filter((l) => l.id != b.dataset.removeBasket); renderPricing(); };
+  });
+  document.querySelectorAll("[data-basket-qty]").forEach((inp) => {
+    inp.onchange = () => {
+      const line = state.basket.find((l) => l.id == inp.dataset.basketQty);
+      if (line) line.quantity = parseFloat(inp.value) || 0;
+      renderPricing();
+    };
+  });
+  document.querySelectorAll("[data-basket-discount]").forEach((inp) => {
+    inp.onchange = () => {
+      const line = state.basket.find((l) => l.id == inp.dataset.basketDiscount);
+      if (line) line.discount = parseFloat(inp.value) || 0;
+      renderPricing();
+    };
+  });
+}
+
+async function renderBasketRows() {
+  if (!state.basket.length) return `<p class="text-sm text-slate-400">No lines yet.</p>`;
+  const rows = [];
+  let totalValue = 0, totalQty = 0, totalCostQty = 0, totalDeliveryQty = 0;
+  for (const line of state.basket) {
+    const product = state.products.find((p) => p.code === line.productCode);
+    const customer = state.customers.find((c) => c.id === line.customerId);
+    const build = await costBuildUp(line.productCode);
+    const finalPrice = (product.selling_price || 0) * (1 - customer.rebate_pct) * (1 - (line.discount || 0));
+    const contrib = finalPrice - build.total - customer.delivery_rate;
+    const marginPct = finalPrice ? contrib / finalPrice : 0;
+    const lineValue = finalPrice * line.quantity;
+    totalValue += lineValue; totalQty += line.quantity;
+    totalCostQty += build.total * line.quantity;
+    totalDeliveryQty += customer.delivery_rate * line.quantity;
+    rows.push(`<tr class="border-b border-slate-50">
+      <td class="py-2">${product.description}</td>
+      <td class="py-2">${customer.name}</td>
+      <td class="py-2 text-right"><input data-basket-qty="${line.id}" type="number" value="${line.quantity}" class="w-16 border border-slate-200 rounded px-1 py-0.5 text-right text-sm" /></td>
+      <td class="py-2 text-right"><input data-basket-discount="${line.id}" type="number" step="0.01" value="${line.discount}" class="w-14 border border-slate-200 rounded px-1 py-0.5 text-right text-sm" /></td>
+      <td class="py-2 text-right tabular-nums text-sm">${money(finalPrice)}</td>
+      <td class="py-2 text-right tabular-nums text-sm">${money(build.total)}</td>
+      <td class="py-2 text-right tabular-nums text-sm ${marginPct < 0 ? "text-red-600" : "text-emerald-600"}">${pct(marginPct)}</td>
+      <td class="py-2 text-right tabular-nums text-sm">${money(lineValue)}</td>
+      <td class="py-2 text-right"><button data-remove-basket="${line.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+    </tr>`);
+  }
+  const blendedMargin = totalValue ? (totalValue - totalCostQty - totalDeliveryQty) / totalValue : 0;
+  return `
+    <div class="text-xs text-slate-500 mb-2">${totalQty.toLocaleString()} units \u00b7 blended margin ${pct(blendedMargin)}</div>
+    <table class="w-full text-sm">
+      <thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Product</th><th class="font-normal pb-2">Customer</th>
+        <th class="font-normal pb-2 text-right">Qty</th><th class="font-normal pb-2 text-right">Discount</th>
+        <th class="font-normal pb-2 text-right">Final price</th><th class="font-normal pb-2 text-right">Cost</th>
+        <th class="font-normal pb-2 text-right">Margin</th><th class="font-normal pb-2 text-right">Line value</th><th></th>
+      </tr></thead>
+      <tbody>${rows.join("")}</tbody>
+    </table>`;
+}
+
+function renderShell(inner) {
+  const tabs = ["pricing", "products", "customers", "materials"];
+  const tabBtns = tabs.map((t) => `<button data-tab="${t}" class="tab-btn px-3 py-1.5 text-sm rounded-md capitalize ${state.tab === t ? "active" : "text-slate-600 hover:bg-slate-100"}">${t}</button>`).join("");
+  return `
+    <div class="flex items-center justify-between mb-6">
+      <div>
+        <h1 class="text-xl font-semibold">Fusco Foods pricing</h1>
+        <p class="text-sm text-slate-500">Connected to Supabase \u2014 live data</p>
+      </div>
+      <div class="flex items-center gap-2 bg-white border border-slate-200 rounded-lg p-1">
+        <button data-mode="actual" class="px-3 py-1.5 text-sm rounded-md ${state.mode === "actual" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}">Actual</button>
+        <button data-mode="budgeted" class="px-3 py-1.5 text-sm rounded-md ${state.mode === "budgeted" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}">Budgeted</button>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 bg-white border border-slate-200 rounded-lg p-1 mb-6 w-fit">${tabBtns}</div>
+    ${inner}
+  `;
+}
+
+function attachShellHandlers() {
+  document.querySelectorAll("[data-tab]").forEach((b) => {
+    b.onclick = () => { state.tab = b.dataset.tab; render(); };
+  });
+  document.querySelectorAll("[data-mode]").forEach((b) => {
+    b.onclick = () => { state.mode = b.dataset.mode; render(); };
+  });
+}
+
+// ---------- simple CRUD tabs ----------
+async function renderProducts() {
+  const rows = state.products.map((p) => `
+    <tr class="border-b border-slate-50 text-sm">
+      <td class="py-2">${p.code}</td>
+      <td class="py-2">${p.description}</td>
+      <td class="py-2 text-right">${money(p.selling_price || 0)}</td>
+      <td class="py-2 capitalize">${p.site_id}</td>
+    </tr>`).join("");
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-3">Add a product</h2>
+      <form id="form-product" class="grid grid-cols-5 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Code</label><input name="code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Description</label><input name="description" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Selling price</label><input name="selling_price" type="number" step="0.01" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Site</label>
+          <select name="site_id" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"><option value="stillorgan">Stillorgan</option><option value="kilcoole">Kilcoole</option></select>
+        </div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
+      </form>
+    </div>
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Code</th><th class="font-normal pb-2">Description</th><th class="font-normal pb-2 text-right">Price</th><th class="font-normal pb-2">Site</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>`);
+  attachShellHandlers();
+  el("form-product").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("products").insert({ code: f.get("code"), description: f.get("description"), selling_price: parseFloat(f.get("selling_price")) || null, site_id: f.get("site_id") });
+    await loadAll(); renderProducts();
+  };
+}
+
+async function renderCustomers() {
+  const rows = state.customers.map((c) => `
+    <tr class="border-b border-slate-50 text-sm">
+      <td class="py-2">${c.name}</td>
+      <td class="py-2 text-right">${pct(c.rebate_pct)}</td>
+      <td class="py-2 text-right">${money4(c.delivery_rate)}</td>
+    </tr>`).join("");
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-3">Add a customer</h2>
+      <form id="form-customer" class="grid grid-cols-4 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Name</label><input name="name" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Rebate % (0\u20131)</label><input name="rebate_pct" type="number" step="0.0001" value="0" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Delivery \u20ac/unit</label><input name="delivery_rate" type="number" step="0.0001" value="0" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
+      </form>
+    </div>
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Name</th><th class="font-normal pb-2 text-right">Rebate</th><th class="font-normal pb-2 text-right">Delivery</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>`);
+  attachShellHandlers();
+  el("form-customer").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("customers").insert({ name: f.get("name"), rebate_pct: parseFloat(f.get("rebate_pct")) || 0, delivery_rate: parseFloat(f.get("delivery_rate")) || 0 });
+    await loadAll(); renderCustomers();
+  };
+}
+
+async function renderMaterials() {
+  const rows = state.materials.map((m) => `
+    <tr class="border-b border-slate-50 text-sm">
+      <td class="py-2">${m.code}</td>
+      <td class="py-2">${m.description}</td>
+      <td class="py-2">${m.vendor || ""}</td>
+      <td class="py-2 text-right">${money4(m.cost_per_unit || 0)}</td>
+      <td class="py-2">${m.unit_of_measure || ""}</td>
+    </tr>`).join("");
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-3">Add a material</h2>
+      <form id="form-material" class="grid grid-cols-6 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Code</label><input name="code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Description</label><input name="description" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Vendor</label><input name="vendor" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Cost/unit</label><input name="cost_per_unit" type="number" step="0.0001" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Unit</label><input name="unit_of_measure" placeholder="kg, each..." class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
+      </form>
+    </div>
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Code</th><th class="font-normal pb-2">Description</th><th class="font-normal pb-2">Vendor</th><th class="font-normal pb-2 text-right">Cost/unit</th><th class="font-normal pb-2">UoM</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>`);
+  attachShellHandlers();
+  el("form-material").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("materials").insert({ code: f.get("code"), description: f.get("description"), vendor: f.get("vendor") || null, cost_per_unit: parseFloat(f.get("cost_per_unit")) || null, unit_of_measure: f.get("unit_of_measure") || null });
+    await loadAll(); renderMaterials();
+  };
+}
+
+async function render() {
+  if (state.tab === "pricing") await renderPricing();
+  else if (state.tab === "products") await renderProducts();
+  else if (state.tab === "customers") await renderCustomers();
+  else if (state.tab === "materials") await renderMaterials();
+  attachShellHandlers();
+}
+
+(async function init() {
+  el("app").innerHTML = `<p class="text-slate-500 p-6">Loading\u2026</p>`;
+  await loadAll();
+  await render();
+})();
+</script>
+</body>
+</html>
