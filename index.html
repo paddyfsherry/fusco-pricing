@@ -31,6 +31,7 @@ let state = {
   materials: [],
   uoms: [],
   materialCosts: {},
+  expandedMaterial: null,
   productCode: null,
   customerId: null,
   productQuery: null,
@@ -468,6 +469,16 @@ async function renderMaterials() {
   const uomOpts = (code) => state.uoms.map((u) =>
     `<option value="${u.code}" ${u.code === code ? "selected" : ""}>${u.name}</option>`).join("");
 
+  // pull the purchase history for whichever material is expanded
+  let history = [];
+  if (state.expandedMaterial) {
+    const { data } = await sb.from("material_purchases").select("*")
+      .eq("material_code", state.expandedMaterial)
+      .order("purchase_date", { ascending: false })
+      .order("created_at", { ascending: false });
+    history = data || [];
+  }
+
   const rows = state.materials.map((m) => {
     const c = state.materialCosts[m.code];
     const derived = c
@@ -475,14 +486,43 @@ async function renderMaterials() {
       : (m.cost_per_unit
           ? `<span class="text-amber-700" title="Legacy pack price from the stock file \u2014 no unit, not usable for recipes until a purchase is recorded">${money4(m.cost_per_unit)} <span class="text-xs">pack</span></span>`
           : `<span class="text-slate-400 text-xs">none</span>`);
-    return `<tr class="border-b border-slate-50 text-sm">
-      <td class="py-2">${m.code}</td>
+    const isOpen = state.expandedMaterial === m.code;
+    const chevron = isOpen ? "\u25be" : "\u25b8";
+
+    let detail = "";
+    if (isOpen) {
+      const driving = history.length ? history[0].id : null;
+      const histRows = history.map((h) => `
+        <tr class="text-sm ${h.id === driving ? "bg-emerald-50" : ""}">
+          <td class="py-1.5 pl-2">${h.purchase_date}</td>
+          <td class="py-1.5">${h.supplier || "\u2014"}</td>
+          <td class="py-1.5 text-right">${h.pack_quantity} ${m.uom_code || ""}</td>
+          <td class="py-1.5 text-right">${money(h.pack_price)}</td>
+          <td class="py-1.5 text-right font-medium">${money4(h.pack_price / h.pack_quantity)}</td>
+          <td class="py-1.5">${h.invoice_ref || "\u2014"}</td>
+          <td class="py-1.5 text-xs text-emerald-700">${h.id === driving ? "in use" : ""}</td>
+          <td class="py-1.5 text-right pr-2"><button data-del-hist="${h.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+        </tr>`).join("");
+      detail = `<tr><td colspan="5" class="bg-slate-50 px-3 py-3">
+        <div class="text-xs text-slate-500 mb-2">Purchase history \u2014 the most recent buy sets the cost per unit.</div>
+        ${history.length ? `<table class="w-full">
+          <thead><tr class="text-left text-xs text-slate-500 border-b border-slate-200">
+            <th class="font-normal pb-1 pl-2">Date</th><th class="font-normal pb-1">Supplier</th>
+            <th class="font-normal pb-1 text-right">Pack qty</th><th class="font-normal pb-1 text-right">Pack price</th>
+            <th class="font-normal pb-1 text-right">\u20ac/unit</th><th class="font-normal pb-1">Invoice ref</th><th></th><th></th>
+          </tr></thead><tbody>${histRows}</tbody></table>`
+          : `<p class="text-sm text-slate-400">No purchases recorded for this material yet \u2014 add one on the Purchases tab.</p>`}
+      </td></tr>`;
+    }
+
+    return `<tr class="border-b border-slate-50 text-sm ${isOpen ? "bg-slate-50" : ""}">
+      <td class="py-2"><button data-expand="${m.code}" class="text-slate-400 hover:text-slate-700 mr-1">${chevron}</button>${m.code}</td>
       <td class="py-2">${m.description}</td>
       <td class="py-2"><select data-uom="${m.code}" class="border border-slate-200 rounded px-1 py-0.5 text-sm">
         <option value="">\u2014</option>${uomOpts(m.uom_code)}</select></td>
       <td class="py-2 text-right">${derived}</td>
       <td class="py-2 text-xs text-slate-500">${c ? (c.supplier || "") + " \u00b7 " + c.purchase_date : ""}</td>
-    </tr>`;
+    </tr>${detail}`;
   }).join("");
 
   const withUnit = state.materials.filter((m) => m.uom_code).length;
@@ -517,6 +557,18 @@ async function renderMaterials() {
   document.querySelectorAll("[data-uom]").forEach((s) => {
     s.onchange = async () => {
       await sb.from("materials").update({ uom_code: s.value || null }).eq("code", s.dataset.uom);
+      await loadAll(); renderMaterials();
+    };
+  });
+  document.querySelectorAll("[data-expand]").forEach((b) => {
+    b.onclick = () => {
+      state.expandedMaterial = state.expandedMaterial === b.dataset.expand ? null : b.dataset.expand;
+      renderMaterials();
+    };
+  });
+  document.querySelectorAll("[data-del-hist]").forEach((b) => {
+    b.onclick = async () => {
+      await sb.from("material_purchases").delete().eq("id", b.dataset.delHist);
       await loadAll(); renderMaterials();
     };
   });
