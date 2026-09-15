@@ -34,6 +34,9 @@ let state = {
   materialCosts: {},
   expandedMaterials: [],
   materialHistory: {},
+  importTarget: "materials",
+  importRows: null,
+  importMsg: "",
   productCode: null,
   customerId: null,
   productQuery: null,
@@ -377,7 +380,7 @@ async function renderBasketRows() {
 }
 
 function renderShell(inner) {
-  const tabs = ["pricing", "products", "customers", "materials", "purchases", "costs", "recipes", "labour", "settings"];
+  const tabs = ["pricing", "products", "customers", "materials", "purchases", "costs", "recipes", "labour", "settings", "import"];
   const tabBtns = tabs.map((t) => `<button data-tab="${t}" class="tab-btn px-3 py-1.5 text-sm rounded-md capitalize ${state.tab === t ? "active" : "text-slate-600 hover:bg-slate-100"}">${t}</button>`).join("");
   return `
     <div class="flex items-center justify-between mb-6">
@@ -1029,6 +1032,312 @@ async function renderSettings() {
   });
 }
 
+// ---------- CSV import ----------
+const IMPORT_TARGETS = {
+  materials: {
+    label: "Materials",
+    table: "materials",
+    key: ["code"],
+    cols: ["code", "description", "uom_code"],
+    required: ["code", "description"],
+    numeric: [],
+    sample: ["P0897", "Cornstarch (Cold Process)", "kg"],
+    note: "uom_code must be one of the units on the Materials tab (kg, g, litre, ml, each, case, roll, sheet, metre). Leave blank to set later.",
+  },
+  products: {
+    label: "Products",
+    table: "products",
+    key: ["code"],
+    cols: ["code", "description", "selling_price", "site_id"],
+    required: ["code", "description", "site_id"],
+    numeric: ["selling_price"],
+    sample: ["S277", "FF Salted Caramel Roulade", "11.61", "kilcoole"],
+    note: "site_id must be stillorgan or kilcoole.",
+  },
+  customers: {
+    label: "Customers",
+    table: "customers",
+    key: ["name"],
+    cols: ["name", "rebate_pct", "delivery_rate"],
+    required: ["name"],
+    numeric: ["rebate_pct", "delivery_rate"],
+    sample: ["Pallas Foods", "9.39", "0.20"],
+    note: "rebate_pct is a plain percentage \u2014 9.39 means 9.39%.",
+  },
+  recipe_lines: {
+    label: "Recipes",
+    table: "recipe_lines",
+    key: ["product_code", "material_code"],
+    cols: ["product_code", "material_code", "quantity_per_batch"],
+    required: ["product_code", "material_code", "quantity_per_batch"],
+    numeric: ["quantity_per_batch"],
+    sample: ["S277", "P4002SC", "12"],
+    note: "Quantity is per batch, in the material's own unit. A product/material pair already on file is treated as a change, not a duplicate.",
+  },
+  product_costs: {
+    label: "Product costs",
+    table: "product_costs",
+    key: ["product_code", "cost_type"],
+    cols: ["product_code", "cost_type", "tier", "value", "source"],
+    required: ["product_code", "cost_type", "tier"],
+    numeric: ["value"],
+    sample: ["S277", "ingredient", "confirmed", "4.20", "AF costing sheet"],
+    note: "cost_type is ingredient or packaging. tier is recipe, confirmed or placeholder \u2014 leave value blank when tier is recipe.",
+  },
+  material_purchases: {
+    label: "Purchases",
+    table: "material_purchases",
+    key: null,
+    cols: ["material_code", "supplier_ref", "purchase_date", "pack_quantity", "pack_price", "invoice_ref"],
+    required: ["material_code", "purchase_date", "pack_quantity", "pack_price"],
+    numeric: ["pack_quantity", "pack_price"],
+    sample: ["P0897", "OB01", "2026-08-31", "25", "37.34", "INV-1234"],
+    note: "Purchases have no natural key, so every row is added as new \u2014 they are never matched against what's already there.",
+  },
+};
+
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i], next = text[i + 1];
+    if (inQuotes) {
+      if (ch === '"' && next === '"') { field += '"'; i++; }
+      else if (ch === '"') inQuotes = false;
+      else field += ch;
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === ",") { row.push(field); field = ""; }
+    else if (ch === "\r") { /* skip */ }
+    else if (ch === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else field += ch;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter((r) => r.some((c) => c.trim() !== ""));
+}
+
+function downloadCSV(name, rows) {
+  const csv = rows.map((r) => r.map((c) => /[",\n]/.test(c) ? '"' + String(c).replace(/"/g, '""') + '"' : c).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function analyseImport(targetKey, text) {
+  const t = IMPORT_TARGETS[targetKey];
+  const parsed = parseCSV(text);
+  if (!parsed.length) return { error: "That file appears to be empty." };
+
+  const header = parsed[0].map((h) => h.trim().toLowerCase());
+  const missingCols = t.required.filter((c) => !header.includes(c));
+  if (missingCols.length) {
+    return { error: `Missing required column(s): ${missingCols.join(", ")}. Expected header: ${t.cols.join(", ")}` };
+  }
+
+  // reference data for validation
+  const productCodes = new Set(state.products.map((p) => p.code));
+  const materialCodes = new Set(state.materials.map((m) => m.code));
+  const uomCodes = new Set(state.uoms.map((u) => u.code));
+  const supplierRefs = new Set(state.suppliers.map((s) => s.account_ref));
+
+  // what's already there
+  let existing = [];
+  if (t.key) {
+    const { data } = await sb.from(t.table).select("*");
+    existing = data || [];
+  }
+  const keyOf = (o) => t.key.map((k) => String(o[k] ?? "").trim().toLowerCase()).join("||");
+  const existingByKey = {};
+  existing.forEach((e) => { existingByKey[keyOf(e)] = e; });
+
+  const out = [];
+  for (let i = 1; i < parsed.length; i++) {
+    const cells = parsed[i];
+    const rec = {};
+    t.cols.forEach((c) => {
+      const idx = header.indexOf(c);
+      rec[c] = idx >= 0 ? String(cells[idx] ?? "").trim() : "";
+    });
+
+    const errors = [];
+    t.required.forEach((c) => { if (!rec[c]) errors.push(`${c} is required`); });
+    t.numeric.forEach((c) => {
+      if (rec[c] !== "" && isNaN(parseFloat(rec[c]))) errors.push(`${c} is not a number`);
+    });
+    if (rec.product_code && !productCodes.has(rec.product_code)) errors.push(`no product ${rec.product_code}`);
+    if (rec.material_code && !materialCodes.has(rec.material_code)) errors.push(`no material ${rec.material_code}`);
+    if (rec.uom_code && !uomCodes.has(rec.uom_code)) errors.push(`unknown unit ${rec.uom_code}`);
+    if (rec.supplier_ref && !supplierRefs.has(rec.supplier_ref)) errors.push(`no supplier ${rec.supplier_ref}`);
+    if (rec.site_id && !["stillorgan", "kilcoole"].includes(rec.site_id.toLowerCase())) errors.push("site must be stillorgan or kilcoole");
+    if (rec.cost_type && !["ingredient", "packaging"].includes(rec.cost_type.toLowerCase())) errors.push("cost_type must be ingredient or packaging");
+    if (rec.tier && !["recipe", "confirmed", "placeholder"].includes(rec.tier.toLowerCase())) errors.push("tier must be recipe, confirmed or placeholder");
+
+    // build the payload
+    const payload = {};
+    t.cols.forEach((c) => {
+      let v = rec[c];
+      if (v === "") { payload[c] = null; return; }
+      if (t.numeric.includes(c)) v = parseFloat(v);
+      if (c === "rebate_pct") v = Math.round((v / 100) * 1e6) / 1e6;
+      if (c === "site_id" || c === "cost_type" || c === "tier") v = String(v).toLowerCase();
+      payload[c] = v;
+    });
+
+    let status = "new", changes = [];
+    if (t.key && !errors.length) {
+      const match = existingByKey[keyOf(rec)];
+      if (match) {
+        t.cols.forEach((c) => {
+          if (t.key.includes(c)) return;
+          const oldV = match[c], newV = payload[c];
+          const same = (oldV === null || oldV === undefined ? "" : String(oldV)) === (newV === null ? "" : String(newV))
+            || (typeof oldV === "number" && Number(oldV) === Number(newV));
+          if (!same) changes.push({ col: c, from: oldV, to: newV });
+        });
+        status = changes.length ? "change" : "unchanged";
+      }
+    }
+    if (errors.length) status = "error";
+    out.push({ line: i + 1, rec, payload, status, changes, errors, selected: status === "new" || status === "change" });
+  }
+  return { rows: out };
+}
+
+async function renderImport() {
+  const t = IMPORT_TARGETS[state.importTarget];
+  const targetOpts = Object.entries(IMPORT_TARGETS)
+    .map(([k, v]) => `<option value="${k}" ${k === state.importTarget ? "selected" : ""}>${v.label}</option>`).join("");
+
+  let preview = "";
+  if (state.importRows) {
+    const counts = { new: 0, change: 0, unchanged: 0, error: 0 };
+    state.importRows.forEach((r) => counts[r.status]++);
+    const selectable = state.importRows.filter((r) => r.status !== "error" && r.status !== "unchanged");
+    const allSelected = selectable.length > 0 && selectable.every((r) => r.selected);
+
+    const rowsHtml = state.importRows.map((r, i) => {
+      const badge = {
+        new: '<span class="text-xs px-2 py-0.5 rounded border bg-emerald-50 text-emerald-700 border-emerald-200">New</span>',
+        change: '<span class="text-xs px-2 py-0.5 rounded border bg-blue-50 text-blue-700 border-blue-200">Change</span>',
+        unchanged: '<span class="text-xs px-2 py-0.5 rounded border bg-slate-50 text-slate-500 border-slate-200">No change</span>',
+        error: '<span class="text-xs px-2 py-0.5 rounded border bg-red-50 text-red-700 border-red-200">Error</span>',
+      }[r.status];
+      const detail = r.status === "error"
+        ? `<span class="text-xs text-red-600">${r.errors.join("; ")}</span>`
+        : r.status === "change"
+          ? r.changes.map((c) => `<span class="text-xs text-slate-600">${c.col}: <span class="text-slate-400">${c.from ?? "\u2014"}</span> \u2192 <b>${c.to ?? "\u2014"}</b></span>`).join("<br>")
+          : "";
+      const canSelect = r.status === "new" || r.status === "change";
+      return `<tr class="border-b border-slate-50 text-sm ${r.status === "error" ? "bg-red-50/40" : ""}">
+        <td class="py-1.5 pl-2">${canSelect ? `<input type="checkbox" data-imp-row="${i}" ${r.selected ? "checked" : ""} />` : ""}</td>
+        <td class="py-1.5 text-xs text-slate-400">${r.line}</td>
+        <td class="py-1.5">${badge}</td>
+        ${t.cols.map((c) => `<td class="py-1.5 text-xs">${r.rec[c] || "\u2014"}</td>`).join("")}
+        <td class="py-1.5">${detail}</td>
+      </tr>`;
+    }).join("");
+
+    const selCount = state.importRows.filter((r) => r.selected).length;
+    preview = `
+      <div class="bg-white border border-slate-200 rounded-xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <p class="text-sm text-slate-600">${counts.new} new \u00b7 ${counts.change} changed \u00b7 ${counts.unchanged} unchanged \u00b7 ${counts.error} with errors</p>
+          <div class="flex items-center gap-2">
+            <button id="btn-imp-cancel" class="text-sm px-3 py-1.5 rounded-md border border-slate-300 hover:bg-slate-50">Cancel</button>
+            <button id="btn-imp-commit" class="text-sm px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800 ${selCount ? "" : "opacity-40 pointer-events-none"}">Import ${selCount} row${selCount === 1 ? "" : "s"}</button>
+          </div>
+        </div>
+        <table class="w-full">
+          <thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+            <th class="font-normal pb-2 pl-2"><input type="checkbox" id="imp-all" ${allSelected ? "checked" : ""} /></th>
+            <th class="font-normal pb-2">Line</th><th class="font-normal pb-2">Status</th>
+            ${t.cols.map((c) => `<th class="font-normal pb-2">${c}</th>`).join("")}
+            <th class="font-normal pb-2">Detail</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>`;
+  }
+
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-1">Import from CSV</h2>
+      <p class="text-xs text-slate-500 mb-3">Nothing is written until you review the preview and choose which rows to import.</p>
+      <div class="flex items-end gap-3">
+        <div>
+          <label class="text-xs text-slate-500">What are you importing?</label>
+          <select id="sel-import-target" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm">${targetOpts}</select>
+        </div>
+        <button id="btn-template" class="text-sm px-3 py-1.5 rounded-md border border-slate-300 hover:bg-slate-50">Download template</button>
+        <div>
+          <label class="text-xs text-slate-500">CSV file</label>
+          <input id="in-csv" type="file" accept=".csv,text/csv" class="block mt-1 text-sm" />
+        </div>
+      </div>
+      <p class="text-xs text-slate-500 mt-3">Columns: <span class="font-mono">${t.cols.join(", ")}</span></p>
+      <p class="text-xs text-slate-500 mt-1">${t.note}</p>
+      ${state.importMsg ? `<p class="text-sm mt-3 ${state.importMsg.startsWith("Error") ? "text-red-600" : "text-emerald-700"}">${state.importMsg}</p>` : ""}
+    </div>
+    ${preview}
+  `);
+  attachShellHandlers();
+
+  el("sel-import-target").onchange = (e) => {
+    state.importTarget = e.target.value;
+    state.importRows = null; state.importMsg = "";
+    renderImport();
+  };
+  el("btn-template").onclick = () => {
+    downloadCSV(`fusco_${state.importTarget}_template.csv`, [t.cols, t.sample]);
+  };
+  el("in-csv").onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const text = await file.text();
+    const result = await analyseImport(state.importTarget, text);
+    if (result.error) { state.importMsg = "Error: " + result.error; state.importRows = null; }
+    else { state.importRows = result.rows; state.importMsg = ""; }
+    renderImport();
+  };
+
+  if (state.importRows) {
+    document.querySelectorAll("[data-imp-row]").forEach((cb) => {
+      cb.onchange = () => { state.importRows[cb.dataset.impRow].selected = cb.checked; renderImport(); };
+    });
+    el("imp-all").onchange = (e) => {
+      state.importRows.forEach((r) => {
+        if (r.status === "new" || r.status === "change") r.selected = e.target.checked;
+      });
+      renderImport();
+    };
+    el("btn-imp-cancel").onclick = () => { state.importRows = null; state.importMsg = ""; renderImport(); };
+    el("btn-imp-commit").onclick = async () => {
+      const chosen = state.importRows.filter((r) => r.selected);
+      if (!chosen.length) return;
+      const payloads = chosen.map((r) => r.payload);
+      let err = null;
+      if (t.key) {
+        const res = await sb.from(t.table).upsert(payloads, { onConflict: t.key.join(",") });
+        err = res.error;
+      } else {
+        const res = await sb.from(t.table).insert(payloads);
+        err = res.error;
+      }
+      if (err) {
+        state.importMsg = "Error: " + err.message;
+      } else {
+        state.importMsg = `Imported ${chosen.length} row${chosen.length === 1 ? "" : "s"} into ${t.label}.`;
+        state.importRows = null;
+        state.materialHistory = {};
+        await loadAll();
+      }
+      renderImport();
+    };
+  }
+}
+
 async function render() {
   if (state.tab === "pricing") await renderPricing();
   else if (state.tab === "products") await renderProducts();
@@ -1039,6 +1348,7 @@ async function render() {
   else if (state.tab === "recipes") await renderRecipes();
   else if (state.tab === "labour") await renderLabour();
   else if (state.tab === "settings") await renderSettings();
+  else if (state.tab === "import") await renderImport();
   attachShellHandlers();
 }
 
