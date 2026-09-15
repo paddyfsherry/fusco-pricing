@@ -32,7 +32,8 @@ let state = {
   uoms: [],
   suppliers: [],
   materialCosts: {},
-  expandedMaterial: null,
+  expandedMaterials: [],
+  materialHistory: {},
   productCode: null,
   customerId: null,
   productQuery: null,
@@ -474,14 +475,15 @@ async function renderMaterials() {
   const uomOpts = (code) => state.uoms.map((u) =>
     `<option value="${u.code}" ${u.code === code ? "selected" : ""}>${u.name}</option>`).join("");
 
-  // pull the purchase history for whichever material is expanded
-  let history = [];
-  if (state.expandedMaterial) {
+  // fetch purchase history for any expanded material we haven't loaded yet
+  const toFetch = state.expandedMaterials.filter((c) => !state.materialHistory[c]);
+  if (toFetch.length) {
     const { data } = await sb.from("material_purchases").select("*")
-      .eq("material_code", state.expandedMaterial)
+      .in("material_code", toFetch)
       .order("purchase_date", { ascending: false })
       .order("created_at", { ascending: false });
-    history = data || [];
+    toFetch.forEach((c) => { state.materialHistory[c] = []; });
+    (data || []).forEach((h) => { state.materialHistory[h.material_code].push(h); });
   }
 
   const rows = state.materials.map((m) => {
@@ -491,7 +493,8 @@ async function renderMaterials() {
       : (m.cost_per_unit
           ? `<span class="text-amber-700" title="Legacy pack price from the stock file \u2014 no unit, not usable for recipes until a purchase is recorded">${money4(m.cost_per_unit)} <span class="text-xs">pack</span></span>`
           : `<span class="text-slate-400 text-xs">none</span>`);
-    const isOpen = state.expandedMaterial === m.code;
+    const isOpen = state.expandedMaterials.includes(m.code);
+    const history = state.materialHistory[m.code] || [];
     const chevron = isOpen ? "\u25be" : "\u25b8";
 
     let detail = "";
@@ -567,13 +570,17 @@ async function renderMaterials() {
   });
   document.querySelectorAll("[data-expand]").forEach((b) => {
     b.onclick = () => {
-      state.expandedMaterial = state.expandedMaterial === b.dataset.expand ? null : b.dataset.expand;
+      const c = b.dataset.expand;
+      state.expandedMaterials = state.expandedMaterials.includes(c)
+        ? state.expandedMaterials.filter((x) => x !== c)
+        : state.expandedMaterials.concat(c);
       renderMaterials();
     };
   });
   document.querySelectorAll("[data-del-hist]").forEach((b) => {
     b.onclick = async () => {
       await sb.from("material_purchases").delete().eq("id", b.dataset.delHist);
+      state.materialHistory = {};
       await loadAll(); renderMaterials();
     };
   });
@@ -651,6 +658,7 @@ async function renderPurchases() {
       invoice_ref: el("in-invoice-ref").value || null,
     });
     el("in-invoice-ref").value = "";
+    state.materialHistory = {};
     await loadAll(); renderPurchases();
   };
   document.querySelectorAll("[data-del-purchase]").forEach((b) => {
