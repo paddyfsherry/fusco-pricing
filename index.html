@@ -103,7 +103,7 @@ function askChangeDetails(label, oldValue, newValue) {
   return new Promise((resolve) => {
     const active = sessionModeActive();
     if (active) {
-      resolve({ date: new Date().toISOString().slice(0, 10), kind: active.kind, note: "" });
+      resolve({ date: new Date().toISOString().slice(0, 10), note: "" });
       return;
     }
     const wrap = document.createElement("div");
@@ -119,26 +119,15 @@ function askChangeDetails(label, oldValue, newValue) {
                    class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
           </div>
           <div>
-            <label class="text-xs text-slate-500">What kind of change</label>
-            <div class="mt-2 space-y-1 text-sm">
-              <label class="flex items-center gap-2"><input type="radio" name="ch-kind" value="change" checked /> The value changed</label>
-              <label class="flex items-center gap-2"><input type="radio" name="ch-kind" value="correction" /> Fixing an error</label>
-            </div>
+            <label class="text-xs text-slate-500">Note (optional)</label>
+            <input id="ch-note" placeholder="e.g. price rise agreed with Sysco"
+                   class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
           </div>
         </div>
-        <div class="mb-4">
-          <label class="text-xs text-slate-500">Note (optional)</label>
-          <input id="ch-note" placeholder="e.g. price rise agreed with Sysco"
-                 class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
-        </div>
-        <p class="text-xs text-slate-500 mb-4">Fixing an error rewrites that period rather than starting a new one, so past reports come out right.</p>
+        <p class="text-xs text-slate-500 mb-4">This starts a new period from that date. To fix a figure that was wrong, expand the history and edit that period instead.</p>
         <div class="flex items-center justify-between border-t border-slate-100 pt-3">
           <label class="flex items-center gap-2 text-xs text-slate-600">
-            <input id="ch-quiet" type="checkbox" /> Stop asking for 30 minutes, treating everything as
-            <select id="ch-quiet-kind" class="border border-slate-300 rounded px-1 py-0.5 text-xs">
-              <option value="change">changes</option>
-              <option value="correction">corrections</option>
-            </select>
+            <input id="ch-quiet" type="checkbox" /> Stop asking for 30 minutes
           </label>
           <div class="flex gap-2">
             <button id="ch-cancel" class="text-sm px-3 py-1.5 rounded-md border border-slate-300 hover:bg-slate-50">Cancel</button>
@@ -150,11 +139,10 @@ function askChangeDetails(label, oldValue, newValue) {
     const close = (v) => { document.body.removeChild(wrap); resolve(v); };
     wrap.querySelector("#ch-cancel").onclick = () => close(null);
     wrap.querySelector("#ch-save").onclick = () => {
-      const kind = wrap.querySelector('input[name="ch-kind"]:checked').value;
       if (wrap.querySelector("#ch-quiet").checked) {
-        sessionMode = { kind: wrap.querySelector("#ch-quiet-kind").value, until: Date.now() + 30 * 60 * 1000 };
+        sessionMode = { until: Date.now() + 30 * 60 * 1000 };
       }
-      close({ date: wrap.querySelector("#ch-date").value, kind, note: wrap.querySelector("#ch-note").value });
+      close({ date: wrap.querySelector("#ch-date").value, note: wrap.querySelector("#ch-note").value });
     };
     wrap.onclick = (e) => { if (e.target === wrap) close(null); };
   });
@@ -166,27 +154,15 @@ async function changeWithHistory({ entityType, entityKey, field, label, oldValue
   const prior = await historyFor(entityType, entityKey, field);
   const live = prior.filter((h) => !h.superseded_at);
 
-  let details = { date: new Date().toISOString().slice(0, 10), kind: "change", note: "First entry" };
+  let details = { date: new Date().toISOString().slice(0, 10), note: "First entry" };
   if (live.length) {
     details = await askChangeDetails(label, oldValue, newValue);
     if (!details) return false;
   }
 
-  if (details.kind === "correction" && live.length) {
-    // rewrite the period: mark the standing row superseded, new row takes its dates
-    const target = live.find((h) => h.valid_to === null) || live[0];
-    await sb.from("value_history").update({
-      superseded_at: new Date().toISOString(),
-      superseded_by: "app user",
-    }).eq("id", target.id);
-    await sb.from("value_history").insert({
-      entity_type: entityType, entity_key: entityKey, field, label,
-      value_num: newValue, valid_from: target.valid_from, valid_to: target.valid_to,
-      correction_of: target.id, changed_by: "app user",
-      note: details.note || `Corrected \u2014 was ${oldValue}`,
-    });
-  } else {
-    // a real change: close the standing row the day before, open a new one
+  {
+    // starts a new period from the effective date; fixing a past figure is done
+    // from the history row instead
     const open = live.find((h) => h.valid_to === null);
     const dayBefore = new Date(details.date);
     dayBefore.setDate(dayBefore.getDate() - 1);
