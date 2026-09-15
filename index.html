@@ -608,9 +608,9 @@ async function renderPurchases() {
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
       <h2 class="text-sm font-medium mb-1">Record a purchase</h2>
       <p class="text-xs text-slate-500 mb-3">Pack quantity is in the material's own unit \u2014 a 25kg sack of a kg-based material is 25. The most recent purchase sets that material's cost per unit.</p>
-      <form id="form-purchase" class="grid grid-cols-7 gap-2 items-end">
+      <form id="form-purchase" class="grid grid-cols-9 gap-2 items-end">
         <div class="col-span-2"><label class="text-xs text-slate-500">Material</label><select name="material_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
-        <div><label class="text-xs text-slate-500">Supplier</label>
+        <div class="col-span-2"><label class="text-xs text-slate-500">Supplier</label>
           <input name="supplier_ref" list="supplier-list" placeholder="Type to search\u2026" autocomplete="off" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
           <datalist id="supplier-list">${state.suppliers.map((s) => `<option value="${s.account_ref} \u2014 ${s.name.replace(/"/g, "&quot;")}"></option>`).join("")}</datalist>
         </div>
