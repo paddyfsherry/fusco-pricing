@@ -446,6 +446,7 @@ async function renderProducts() {
 async function renderCustomers() {
   const rows = state.customers.map((c) => `
     <tr class="border-b border-slate-50 text-sm">
+      <td class="py-2">${c.account_ref || "\u2014"}</td>
       <td class="py-2">${c.name}</td>
       <td class="py-2 text-right">${pct(c.rebate_pct)}</td>
       <td class="py-2 text-right">${money4(c.delivery_rate)}</td>
@@ -453,7 +454,8 @@ async function renderCustomers() {
   el("app").innerHTML = renderShell(`
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
       <h2 class="text-sm font-medium mb-3">Add a customer</h2>
-      <form id="form-customer" class="grid grid-cols-4 gap-2 items-end">
+      <form id="form-customer" class="grid grid-cols-5 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Account ref</label><input name="account_ref" placeholder="PA02" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Name</label><input name="name" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Rebate %</label><input name="rebate_pct" type="number" step="0.01" value="0" placeholder="5" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Delivery \u20ac/unit</label><input name="delivery_rate" type="number" step="0.0001" value="0" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
@@ -462,14 +464,14 @@ async function renderCustomers() {
     </div>
     <div class="bg-white border border-slate-200 rounded-xl p-5">
       <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
-        <th class="font-normal pb-2">Name</th><th class="font-normal pb-2 text-right">Rebate</th><th class="font-normal pb-2 text-right">Delivery</th>
+        <th class="font-normal pb-2">Code</th><th class="font-normal pb-2">Name</th><th class="font-normal pb-2 text-right">Rebate</th><th class="font-normal pb-2 text-right">Delivery</th>
       </tr></thead><tbody>${rows}</tbody></table>
     </div>`);
   attachShellHandlers();
   el("form-customer").onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
-    await sb.from("customers").insert({ name: f.get("name"), rebate_pct: (parseFloat(f.get("rebate_pct")) || 0) / 100, delivery_rate: parseFloat(f.get("delivery_rate")) || 0 });
+    await sb.from("customers").insert({ account_ref: f.get("account_ref") || null, name: f.get("name"), rebate_pct: (parseFloat(f.get("rebate_pct")) || 0) / 100, delivery_rate: parseFloat(f.get("delivery_rate")) || 0 });
     await loadAll(); renderCustomers();
   };
 }
@@ -703,8 +705,8 @@ async function renderCosts() {
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
       <h2 class="text-sm font-medium mb-1">Set a cost</h2>
       <p class="text-xs text-slate-500 mb-3">Choose "From recipe" to calculate from the Recipes tab instead of typing a figure. "Estimated" is a rough guess and is flagged everywhere it's used.</p>
-      <form id="form-cost" class="grid grid-cols-6 gap-2 items-end">
-        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
+      <form id="form-cost" class="grid grid-cols-8 gap-2 items-end">
+        <div class="col-span-3"><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
         <div><label class="text-xs text-slate-500">Cost type</label><select name="cost_type" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"><option value="ingredient">Ingredient</option><option value="packaging">Packaging</option></select></div>
         <div><label class="text-xs text-slate-500">Tier</label><select name="tier" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"><option value="confirmed">Confirmed</option><option value="placeholder">Estimated</option><option value="recipe">From recipe</option></select></div>
         <div><label class="text-xs text-slate-500">Value \u20ac/unit</label><input name="value" type="number" step="0.0001" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
@@ -714,8 +716,8 @@ async function renderCosts() {
     </div>
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
       <h2 class="text-sm font-medium mb-3">Wastage % (applies to recipe-costed ingredients)</h2>
-      <form id="form-wastage" class="grid grid-cols-3 gap-2 items-end">
-        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
+      <form id="form-wastage" class="grid grid-cols-5 gap-2 items-end">
+        <div class="col-span-3"><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
         <div><label class="text-xs text-slate-500">Wastage %</label><input name="wastage_pct" type="number" step="0.01" placeholder="3" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Save</button>
       </form>
@@ -782,9 +784,9 @@ async function renderRecipes() {
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
       <h2 class="text-sm font-medium mb-1">Add a recipe line</h2>
       <p class="text-xs text-slate-500 mb-3">Quantity is per batch. For this to feed a product's cost, set that product's Ingredient or Packaging tier to "From recipe" on the Costs tab.</p>
-      <form id="form-recipe" class="grid grid-cols-4 gap-2 items-end">
-        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
-        <div><label class="text-xs text-slate-500">Material</label><select name="material_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
+      <form id="form-recipe" class="grid grid-cols-8 gap-2 items-end">
+        <div class="col-span-3"><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
+        <div class="col-span-3"><label class="text-xs text-slate-500">Material</label><select name="material_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
         <div><label class="text-xs text-slate-500">Qty per batch</label><input name="quantity_per_batch" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
       </form>
@@ -845,8 +847,8 @@ async function renderLabour() {
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
       <h2 class="text-sm font-medium mb-1">Kilcoole \u2014 period labour</h2>
       <p class="text-xs text-slate-500 mb-3">One product runs a whole period, so labour/unit is the period's total cost \u00f7 quantity produced. The most recent entry per product is the one used.</p>
-      <form id="form-kc" class="grid grid-cols-5 gap-2 items-end">
-        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${kcOpts || "<option value=''>No Kilcoole products</option>"}</select></div>
+      <form id="form-kc" class="grid grid-cols-7 gap-2 items-end">
+        <div class="col-span-3"><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${kcOpts || "<option value=''>No Kilcoole products</option>"}</select></div>
         <div><label class="text-xs text-slate-500">Period</label><input name="period_label" placeholder="w/c 01/06/26" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Qty produced</label><input name="quantity_produced" type="number" step="1" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Total labour \u20ac</label><input name="total_labour_cost" type="number" step="0.01" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
@@ -861,8 +863,8 @@ async function renderLabour() {
     <div class="bg-white border border-slate-200 rounded-xl p-5">
       <h2 class="text-sm font-medium mb-1">Stillorgan \u2014 process phases</h2>
       <p class="text-xs text-slate-500 mb-3">A day covers several products, so labour is built from phases and divided by expected output.</p>
-      <form id="form-st" class="grid grid-cols-5 gap-2 items-end mb-4">
-        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${stOpts || "<option value=''>No Stillorgan products</option>"}</select></div>
+      <form id="form-st" class="grid grid-cols-7 gap-2 items-end mb-4">
+        <div class="col-span-3"><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${stOpts || "<option value=''>No Stillorgan products</option>"}</select></div>
         <div><label class="text-xs text-slate-500">Phase</label><input name="phase_name" placeholder="Mixing" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Hours</label><input name="hours" type="number" step="0.01" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Rate \u20ac/hr</label><input name="rate_per_hour" type="number" step="0.01" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
@@ -874,8 +876,8 @@ async function renderLabour() {
       </tr></thead><tbody>${stRows || `<tr><td colspan="6" class="py-3 text-sm text-slate-400">No phases yet.</td></tr>`}</tbody></table>
 
       <h3 class="text-sm font-medium mb-2">Expected output per product</h3>
-      <form id="form-out" class="grid grid-cols-3 gap-2 items-end">
-        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${stOpts || "<option value=''>No Stillorgan products</option>"}</select></div>
+      <form id="form-out" class="grid grid-cols-5 gap-2 items-end">
+        <div class="col-span-3"><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${stOpts || "<option value=''>No Stillorgan products</option>"}</select></div>
         <div><label class="text-xs text-slate-500">Expected output (units)</label><input name="expected_output" type="number" step="1" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Save</button>
       </form>
@@ -1057,12 +1059,12 @@ const IMPORT_TARGETS = {
   customers: {
     label: "Customers",
     table: "customers",
-    key: ["name"],
-    cols: ["name", "rebate_pct", "delivery_rate"],
-    required: ["name"],
+    key: ["account_ref"],
+    cols: ["account_ref", "name", "rebate_pct", "delivery_rate"],
+    required: ["account_ref", "name"],
     numeric: ["rebate_pct", "delivery_rate"],
-    sample: ["Pallas Foods", "9.39", "0.20"],
-    note: "rebate_pct is a plain percentage \u2014 9.39 means 9.39%.",
+    sample: ["PA02", "Pallas Foods", "9.39", "0.20"],
+    note: "account_ref is the Sage sales ledger code. rebate_pct is a plain percentage \u2014 9.39 means 9.39%.",
   },
   recipe_lines: {
     label: "Recipes",
