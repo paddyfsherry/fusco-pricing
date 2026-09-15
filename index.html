@@ -188,6 +188,10 @@ async function changeWithHistory({ entityType, entityKey, field, label, oldValue
   } else {
     // a real change: close the standing row the day before, open a new one
     const open = live.find((h) => h.valid_to === null);
+    const dayBefore = new Date(details.date);
+    dayBefore.setDate(dayBefore.getDate() - 1);
+    const endPrev = dayBefore.toISOString().slice(0, 10);
+
     if (open && details.date <= open.valid_from) {
       // effective on or before the standing row even started, so that version
       // never really applied -- supersede it rather than leave a period that
@@ -202,19 +206,25 @@ async function changeWithHistory({ entityType, entityKey, field, label, oldValue
         correction_of: open.id, changed_by: "app user",
         note: details.note || `Replaced \u2014 was ${oldValue}`,
       });
-      await apply();
-      return true;
+    } else {
+      if (open) {
+        await sb.from("value_history").update({ valid_to: endPrev }).eq("id", open.id);
+      }
+      await sb.from("value_history").insert({
+        entity_type: entityType, entity_key: entityKey, field, label,
+        value_num: newValue, valid_from: details.date, changed_by: "app user",
+        note: details.note || null,
+      });
     }
-    if (open) {
-      const dayBefore = new Date(details.date);
-      dayBefore.setDate(dayBefore.getDate() - 1);
-      await sb.from("value_history").update({ valid_to: dayBefore.toISOString().slice(0, 10) }).eq("id", open.id);
+
+    // Any other live row still running into the new period would overlap it,
+    // leaving a date where two values both claim to apply. Trim them back.
+    for (const h of live) {
+      if (open && h.id === open.id) continue;
+      if (h.valid_from < details.date && (h.valid_to === null || h.valid_to >= details.date)) {
+        await sb.from("value_history").update({ valid_to: endPrev }).eq("id", h.id);
+      }
     }
-    await sb.from("value_history").insert({
-      entity_type: entityType, entity_key: entityKey, field, label,
-      value_num: newValue, valid_from: details.date, changed_by: "app user",
-      note: details.note || null,
-    });
   }
   await apply();
   return true;
@@ -222,18 +232,33 @@ async function changeWithHistory({ entityType, entityKey, field, label, oldValue
 
 function historyTable(rows) {
   if (!rows.length) return `<p class="text-xs text-slate-400">No history recorded yet.</p>`;
+  // show each live row newest first, with any row it replaced tucked underneath
+  const byId = {};
+  rows.forEach((r) => { byId[r.id] = r; });
+  const replaced = {};
+  rows.forEach((r) => { if (r.correction_of) replaced[r.correction_of] = r.id; });
+  const live = rows.filter((r) => !r.superseded_at)
+    .sort((a, b) => (b.valid_from || "").localeCompare(a.valid_from || ""));
+  const ordered = [];
+  live.forEach((r) => {
+    ordered.push(r);
+    rows.filter((x) => x.superseded_at && replaced[x.id] === r.id).forEach((x) => ordered.push(x));
+  });
+  // any superseded row whose replacement we couldn't match, so nothing is hidden
+  rows.filter((r) => r.superseded_at && !ordered.includes(r)).forEach((r) => ordered.push(r));
+
   return `<table class="w-full text-xs">
     <thead><tr class="text-left text-slate-500 border-b border-slate-100">
       <th class="font-normal pb-1">Value</th><th class="font-normal pb-1">Period</th>
       <th class="font-normal pb-1">Note</th><th class="font-normal pb-1">Changed by</th>
     </tr></thead><tbody>
-    ${rows.map((h) => {
+    ${ordered.map((h) => {
       const dead = !!h.superseded_at;
       const period = `${h.valid_from}${h.valid_to ? " \u2192 " + h.valid_to : " \u2192 now"}`;
       return `<tr class="border-b border-slate-50 ${dead ? "opacity-50" : ""}">
-        <td class="py-1 ${dead ? "line-through" : "font-medium"}">${h.value_num ?? h.value_text ?? ""}</td>
+        <td class="py-1 ${dead ? "line-through pl-4" : "font-medium"}">${h.value_num ?? h.value_text ?? ""}</td>
         <td class="py-1 text-slate-600">${period}</td>
-        <td class="py-1 ${dead ? "text-red-600" : "text-slate-600"}">${dead ? "Superseded by a correction" : (h.note || "")}</td>
+        <td class="py-1 ${dead ? "text-red-600" : "text-slate-600"}">${dead ? "Superseded by the row above" : (h.note || "")}</td>
         <td class="py-1 text-slate-500">${h.changed_by || ""} \u00b7 ${(h.changed_at || "").slice(0,10)}</td>
       </tr>`;
     }).join("")}
