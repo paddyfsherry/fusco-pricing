@@ -30,6 +30,7 @@ let state = {
   customers: [],
   materials: [],
   uoms: [],
+  suppliers: [],
   materialCosts: {},
   expandedMaterial: null,
   productCode: null,
@@ -60,6 +61,10 @@ async function loadAll() {
     sb.from("material_current_cost").select("*"),
   ]);
   state.uoms = uoms || [];
+  const { data: suppliers } = await sb.from("suppliers").select("*")
+    .eq("inactive", false).eq("do_not_use", false).eq("is_placeholder", false)
+    .order("name");
+  state.suppliers = suppliers || [];
   state.materialCosts = {};
   (currentCosts || []).forEach((c) => { state.materialCosts[c.material_code] = c; });
   if (!state.productCode && state.products.length) state.productCode = state.products[0].code;
@@ -605,7 +610,10 @@ async function renderPurchases() {
       <p class="text-xs text-slate-500 mb-3">Pack quantity is in the material's own unit \u2014 a 25kg sack of a kg-based material is 25. The most recent purchase sets that material's cost per unit.</p>
       <form id="form-purchase" class="grid grid-cols-7 gap-2 items-end">
         <div class="col-span-2"><label class="text-xs text-slate-500">Material</label><select name="material_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
-        <div><label class="text-xs text-slate-500">Supplier</label><input name="supplier" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Supplier</label>
+          <input name="supplier_ref" list="supplier-list" placeholder="Type to search\u2026" autocomplete="off" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
+          <datalist id="supplier-list">${state.suppliers.map((s) => `<option value="${s.account_ref}">${s.name}</option>`).join("")}</datalist>
+        </div>
         <div><label class="text-xs text-slate-500">Date</label><input name="purchase_date" type="date" value="${new Date().toISOString().slice(0,10)}" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Pack qty</label><input name="pack_quantity" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Pack price \u20ac</label><input name="pack_price" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
@@ -625,9 +633,12 @@ async function renderPurchases() {
   el("form-purchase").onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
+    const ref = (f.get("supplier_ref") || "").trim();
+    const match = state.suppliers.find((s) => s.account_ref === ref);
     await sb.from("material_purchases").insert({
       material_code: f.get("material_code"),
-      supplier: f.get("supplier") || null,
+      supplier_ref: match ? match.account_ref : null,
+      supplier: match ? match.name : (ref || null),
       purchase_date: f.get("purchase_date"),
       pack_quantity: parseFloat(f.get("pack_quantity")),
       pack_price: parseFloat(f.get("pack_price")),
