@@ -29,8 +29,12 @@ let state = {
   products: [],
   customers: [],
   materials: [],
+  uoms: [],
+  materialCosts: {},
   productCode: null,
   customerId: null,
+  productQuery: null,
+  customerQuery: null,
   testPrice: "",
   testVolume: "",
   basket: [],
@@ -50,6 +54,13 @@ async function loadAll() {
   state.products = products || [];
   state.customers = customers || [];
   state.materials = materials || [];
+  const [{ data: uoms }, { data: currentCosts }] = await Promise.all([
+    sb.from("units_of_measure").select("*").order("sort_order"),
+    sb.from("material_current_cost").select("*"),
+  ]);
+  state.uoms = uoms || [];
+  state.materialCosts = {};
+  (currentCosts || []).forEach((c) => { state.materialCosts[c.material_code] = c; });
   if (!state.productCode && state.products.length) state.productCode = state.products[0].code;
   if (!state.customerId && state.customers.length) state.customerId = state.customers[0].id;
 }
@@ -69,9 +80,12 @@ async function costBuildUp(productCode) {
     if (row.tier === "recipe") {
       const { data: lines } = await sb
         .from("recipe_lines")
-        .select("quantity_per_batch, materials(cost_per_unit)")
+        .select("quantity_per_batch, material_code")
         .eq("product_code", productCode);
-      const total = (lines || []).reduce((s, l) => s + (l.quantity_per_batch || 0) * (l.materials?.cost_per_unit || 0), 0);
+      const total = (lines || []).reduce((s, l) => {
+        const c = state.materialCosts[l.material_code];
+        return s + (l.quantity_per_batch || 0) * (c ? Number(c.cost_per_unit) : 0);
+      }, 0);
       const withWastage = costType === "ingredient" ? total * (1 + (product.wastage_pct || 0)) : total;
       return { value: withWastage, tier: "recipe", note: "From recipe" };
     }
@@ -174,8 +188,22 @@ async function renderPricing() {
   const marginAtTest = netAtTest ? contribAtTest / netAtTest : 0;
   const volumeNum = parseFloat(state.testVolume) || 0;
 
-  const productOptions = state.products.map((p) => `<option value="${p.code}" ${p.code === state.productCode ? "selected" : ""}>${p.code} \u2014 ${p.description}</option>`).join("");
-  const customerOptions = state.customers.map((c) => `<option value="${c.id}" ${c.id === state.customerId ? "selected" : ""}>${c.name}</option>`).join("");
+  const prodQuery = state.productQuery ?? `${product.code} \u2014 ${product.description}`;
+  const custQuery = state.customerQuery ?? customer.name;
+  const prodMatches = state.productQuery
+    ? state.products.filter((p) => `${p.code} ${p.description}`.toLowerCase().includes(state.productQuery.toLowerCase())).slice(0, 12)
+    : [];
+  const custMatches = state.customerQuery
+    ? state.customers.filter((c) => c.name.toLowerCase().includes(state.customerQuery.toLowerCase())).slice(0, 12)
+    : [];
+  const prodDropdown = prodMatches.length
+    ? `<div class="absolute z-10 w-full bg-white border border-slate-200 rounded-md mt-1 shadow-sm max-h-60 overflow-y-auto">
+        ${prodMatches.map((p) => `<div data-pick-product="${p.code}" class="px-2 py-1.5 text-sm hover:bg-slate-100 cursor-pointer">${p.code} \u2014 ${p.description}</div>`).join("")}
+      </div>` : "";
+  const custDropdown = custMatches.length
+    ? `<div class="absolute z-10 w-full bg-white border border-slate-200 rounded-md mt-1 shadow-sm max-h-60 overflow-y-auto">
+        ${custMatches.map((c) => `<div data-pick-customer="${c.id}" class="px-2 py-1.5 text-sm hover:bg-slate-100 cursor-pointer">${c.name}</div>`).join("")}
+      </div>` : "";
 
   const costLines = build.lines.map((l) => `
     <div class="flex items-center justify-between text-sm py-0.5">
@@ -189,13 +217,15 @@ async function renderPricing() {
     <div class="grid grid-cols-2 gap-6">
       <div class="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
         <div class="grid grid-cols-2 gap-3">
-          <div>
+          <div class="relative">
             <label class="text-xs text-slate-500">Product</label>
-            <select id="sel-product" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOptions}</select>
+            <input id="sel-product" type="text" value="${prodQuery.replace(/"/g, "&quot;")}" placeholder="Type a code or name\u2026" autocomplete="off" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
+            ${prodDropdown}
           </div>
-          <div>
+          <div class="relative">
             <label class="text-xs text-slate-500">Customer</label>
-            <select id="sel-customer" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm">${customerOptions}</select>
+            <input id="sel-customer" type="text" value="${custQuery.replace(/"/g, "&quot;")}" placeholder="Type a customer name\u2026" autocomplete="off" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
+            ${custDropdown}
           </div>
         </div>
         <p class="text-xs text-slate-500 capitalize">${product.site_id} \u00b7 mode: ${state.mode}</p>
@@ -239,8 +269,40 @@ async function renderPricing() {
     </div>
   `);
 
-  el("sel-product").onchange = (e) => { state.productCode = e.target.value; renderPricing(); };
-  el("sel-customer").onchange = (e) => { state.customerId = e.target.value; renderPricing(); };
+  const prodInput = el("sel-product");
+  prodInput.oninput = (e) => {
+    state.productQuery = e.target.value;
+    const caret = e.target.selectionStart;
+    renderPricing().then(() => {
+      const again = el("sel-product");
+      if (again) { again.focus(); again.setSelectionRange(caret, caret); }
+    });
+  };
+  const custInput = el("sel-customer");
+  custInput.oninput = (e) => {
+    state.customerQuery = e.target.value;
+    const caret = e.target.selectionStart;
+    renderPricing().then(() => {
+      const again = el("sel-customer");
+      if (again) { again.focus(); again.setSelectionRange(caret, caret); }
+    });
+  };
+  document.querySelectorAll("[data-pick-product]").forEach((d) => {
+    d.onmousedown = (ev) => {
+      ev.preventDefault();
+      state.productCode = d.dataset.pickProduct;
+      state.productQuery = null;
+      renderPricing();
+    };
+  });
+  document.querySelectorAll("[data-pick-customer]").forEach((d) => {
+    d.onmousedown = (ev) => {
+      ev.preventDefault();
+      state.customerId = d.dataset.pickCustomer;
+      state.customerQuery = null;
+      renderPricing();
+    };
+  });
   el("in-test-price").oninput = (e) => { state.testPrice = e.target.value; renderPricing(); };
   el("in-test-volume").oninput = (e) => { state.testVolume = e.target.value; renderPricing(); };
   el("btn-add-basket").onclick = () => {
@@ -308,7 +370,7 @@ async function renderBasketRows() {
 }
 
 function renderShell(inner) {
-  const tabs = ["pricing", "products", "customers", "materials"];
+  const tabs = ["pricing", "products", "customers", "materials", "purchases", "costs", "recipes", "labour", "settings"];
   const tabBtns = tabs.map((t) => `<button data-tab="${t}" class="tab-btn px-3 py-1.5 text-sm rounded-md capitalize ${state.tab === t ? "active" : "text-slate-600 hover:bg-slate-100"}">${t}</button>`).join("");
   return `
     <div class="flex items-center justify-between mb-6">
@@ -403,38 +465,491 @@ async function renderCustomers() {
 }
 
 async function renderMaterials() {
-  const rows = state.materials.map((m) => `
-    <tr class="border-b border-slate-50 text-sm">
+  const uomOpts = (code) => state.uoms.map((u) =>
+    `<option value="${u.code}" ${u.code === code ? "selected" : ""}>${u.name}</option>`).join("");
+
+  const rows = state.materials.map((m) => {
+    const c = state.materialCosts[m.code];
+    const derived = c
+      ? `<span title="From ${c.supplier || "purchase"} on ${c.purchase_date}: ${money(c.pack_price)} for ${c.pack_quantity} ${m.uom_code || ""}">${money4(c.cost_per_unit)}</span>`
+      : (m.cost_per_unit
+          ? `<span class="text-amber-700" title="Legacy pack price from the stock file \u2014 no unit, not usable for recipes until a purchase is recorded">${money4(m.cost_per_unit)} <span class="text-xs">pack</span></span>`
+          : `<span class="text-slate-400 text-xs">none</span>`);
+    return `<tr class="border-b border-slate-50 text-sm">
       <td class="py-2">${m.code}</td>
       <td class="py-2">${m.description}</td>
-      <td class="py-2">${m.vendor || ""}</td>
-      <td class="py-2 text-right">${money4(m.cost_per_unit || 0)}</td>
-      <td class="py-2">${m.unit_of_measure || ""}</td>
-    </tr>`).join("");
+      <td class="py-2"><select data-uom="${m.code}" class="border border-slate-200 rounded px-1 py-0.5 text-sm">
+        <option value="">\u2014</option>${uomOpts(m.uom_code)}</select></td>
+      <td class="py-2 text-right">${derived}</td>
+      <td class="py-2 text-xs text-slate-500">${c ? (c.supplier || "") + " \u00b7 " + c.purchase_date : ""}</td>
+    </tr>`;
+  }).join("");
+
+  const withUnit = state.materials.filter((m) => m.uom_code).length;
+  const withCost = Object.keys(state.materialCosts).length;
+
   el("app").innerHTML = renderShell(`
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
-      <h2 class="text-sm font-medium mb-3">Add a material</h2>
-      <form id="form-material" class="grid grid-cols-6 gap-2 items-end">
+      <h2 class="text-sm font-medium mb-1">Add a material</h2>
+      <p class="text-xs text-slate-500 mb-3">A material is the stable thing a recipe points at, measured in one unit. Prices come from the Purchases tab, not here \u2014 so changing pack sizes and different suppliers don't break the recipe link.</p>
+      <form id="form-material" class="grid grid-cols-4 gap-2 items-end">
         <div><label class="text-xs text-slate-500">Code</label><input name="code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <div><label class="text-xs text-slate-500">Description</label><input name="description" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
-        <div><label class="text-xs text-slate-500">Vendor</label><input name="vendor" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
-        <div><label class="text-xs text-slate-500">Cost/unit</label><input name="cost_per_unit" type="number" step="0.0001" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
-        <div><label class="text-xs text-slate-500">Unit</label><input name="unit_of_measure" placeholder="kg, each..." class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Unit of measure</label><select name="uom_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"><option value="">\u2014</option>${uomOpts(null)}</select></div>
         <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
       </form>
     </div>
     <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <p class="text-xs text-slate-500 mb-3">${state.materials.length} materials \u00b7 ${withUnit} have a unit set \u00b7 ${withCost} have a purchase-derived cost per unit. Amber figures are legacy pack prices from the stock file \u2014 they have no unit behind them, so they can't drive a recipe until a purchase is recorded.</p>
       <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
-        <th class="font-normal pb-2">Code</th><th class="font-normal pb-2">Description</th><th class="font-normal pb-2">Vendor</th><th class="font-normal pb-2 text-right">Cost/unit</th><th class="font-normal pb-2">UoM</th>
+        <th class="font-normal pb-2">Code</th><th class="font-normal pb-2">Description</th>
+        <th class="font-normal pb-2">Unit</th><th class="font-normal pb-2 text-right">Cost per unit</th>
+        <th class="font-normal pb-2">Latest purchase</th>
       </tr></thead><tbody>${rows}</tbody></table>
     </div>`);
   attachShellHandlers();
   el("form-material").onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
-    await sb.from("materials").insert({ code: f.get("code"), description: f.get("description"), vendor: f.get("vendor") || null, cost_per_unit: parseFloat(f.get("cost_per_unit")) || null, unit_of_measure: f.get("unit_of_measure") || null });
+    await sb.from("materials").insert({ code: f.get("code"), description: f.get("description"), uom_code: f.get("uom_code") || null });
     await loadAll(); renderMaterials();
   };
+  document.querySelectorAll("[data-uom]").forEach((s) => {
+    s.onchange = async () => {
+      await sb.from("materials").update({ uom_code: s.value || null }).eq("code", s.dataset.uom);
+      await loadAll(); renderMaterials();
+    };
+  });
+}
+
+// ---------- Purchases tab: real buys, per material ----------
+async function renderPurchases() {
+  const { data: purchases } = await sb
+    .from("material_purchases")
+    .select("*, materials(description, uom_code)")
+    .order("purchase_date", { ascending: false })
+    .limit(200);
+
+  const materialOpts = state.materials.map((m) =>
+    `<option value="${m.code}">${m.code} \u2014 ${m.description}${m.uom_code ? " (" + m.uom_code + ")" : ""}</option>`).join("");
+
+  const rows = (purchases || []).map((p) => {
+    const uom = p.materials?.uom_code || "";
+    return `<tr class="border-b border-slate-50 text-sm">
+      <td class="py-2">${p.purchase_date}</td>
+      <td class="py-2">${p.material_code} \u2014 ${p.materials?.description || ""}</td>
+      <td class="py-2">${p.supplier || ""}</td>
+      <td class="py-2 text-right">${p.pack_quantity} ${uom}</td>
+      <td class="py-2 text-right">${money(p.pack_price)}</td>
+      <td class="py-2 text-right font-medium">${money4(p.pack_price / p.pack_quantity)}</td>
+      <td class="py-2 text-xs text-slate-500">${p.invoice_ref || ""}</td>
+      <td class="py-2 text-right"><button data-del-purchase="${p.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+    </tr>`;
+  }).join("");
+
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-1">Record a purchase</h2>
+      <p class="text-xs text-slate-500 mb-3">Pack quantity is in the material's own unit \u2014 a 25kg sack of a kg-based material is 25. The most recent purchase sets that material's cost per unit.</p>
+      <form id="form-purchase" class="grid grid-cols-7 gap-2 items-end">
+        <div class="col-span-2"><label class="text-xs text-slate-500">Material</label><select name="material_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
+        <div><label class="text-xs text-slate-500">Supplier</label><input name="supplier" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Date</label><input name="purchase_date" type="date" value="${new Date().toISOString().slice(0,10)}" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Pack qty</label><input name="pack_quantity" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Pack price \u20ac</label><input name="pack_price" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
+      </form>
+      <div class="mt-2"><label class="text-xs text-slate-500">Invoice ref (optional)</label><input id="in-invoice-ref" class="border border-slate-300 rounded-md px-2 py-1.5 text-sm w-64" /></div>
+    </div>
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Date</th><th class="font-normal pb-2">Material</th><th class="font-normal pb-2">Supplier</th>
+        <th class="font-normal pb-2 text-right">Pack qty</th><th class="font-normal pb-2 text-right">Pack price</th>
+        <th class="font-normal pb-2 text-right">\u20ac/unit</th><th class="font-normal pb-2">Invoice</th><th></th>
+      </tr></thead><tbody>${rows || `<tr><td colspan="8" class="py-3 text-sm text-slate-400">No purchases recorded yet.</td></tr>`}</tbody></table>
+    </div>`);
+  attachShellHandlers();
+
+  el("form-purchase").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("material_purchases").insert({
+      material_code: f.get("material_code"),
+      supplier: f.get("supplier") || null,
+      purchase_date: f.get("purchase_date"),
+      pack_quantity: parseFloat(f.get("pack_quantity")),
+      pack_price: parseFloat(f.get("pack_price")),
+      invoice_ref: el("in-invoice-ref").value || null,
+    });
+    el("in-invoice-ref").value = "";
+    await loadAll(); renderPurchases();
+  };
+  document.querySelectorAll("[data-del-purchase]").forEach((b) => {
+    b.onclick = async () => {
+      await sb.from("material_purchases").delete().eq("id", b.dataset.delPurchase);
+      await loadAll(); renderPurchases();
+    };
+  });
+}
+
+// ---------- Costs tab: the three-tier ingredient/packaging cost ----------
+async function renderCosts() {
+  const { data: allCosts } = await sb.from("product_costs").select("*");
+  const costFor = (code, type) => (allCosts || []).find((c) => c.product_code === code && c.cost_type === type);
+
+  const rows = state.products.map((p) => {
+    const ing = costFor(p.code, "ingredient");
+    const pkg = costFor(p.code, "packaging");
+    const cell = (row, type) => {
+      if (!row) return `<span class="text-slate-400 text-xs">not set</span>`;
+      const badge = tierBadge(row.tier, row.source || row.entered_by || "");
+      const val = row.tier === "recipe" ? `<span class="text-xs text-slate-500">from recipe</span>` : money4(row.value || 0);
+      const promote = row.tier === "placeholder"
+        ? `<button data-promote="${p.code}:${type}" class="text-xs text-blue-600 hover:underline ml-2">confirm</button>` : "";
+      return `${val} ${badge}${promote}`;
+    };
+    return `<tr class="border-b border-slate-50 text-sm">
+      <td class="py-2">${p.code}</td>
+      <td class="py-2">${p.description}</td>
+      <td class="py-2">${cell(ing, "ingredient")}</td>
+      <td class="py-2">${cell(pkg, "packaging")}</td>
+      <td class="py-2 text-right">${pct(p.wastage_pct || 0)}</td>
+    </tr>`;
+  }).join("");
+
+  const productOpts = state.products.map((p) => `<option value="${p.code}">${p.code} \u2014 ${p.description}</option>`).join("");
+
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-1">Set a cost</h2>
+      <p class="text-xs text-slate-500 mb-3">Choose "From recipe" to calculate from the Recipes tab instead of typing a figure. "Estimated" is a rough guess and is flagged everywhere it's used.</p>
+      <form id="form-cost" class="grid grid-cols-6 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
+        <div><label class="text-xs text-slate-500">Cost type</label><select name="cost_type" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"><option value="ingredient">Ingredient</option><option value="packaging">Packaging</option></select></div>
+        <div><label class="text-xs text-slate-500">Tier</label><select name="tier" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"><option value="confirmed">Confirmed</option><option value="placeholder">Estimated</option><option value="recipe">From recipe</option></select></div>
+        <div><label class="text-xs text-slate-500">Value \u20ac/unit</label><input name="value" type="number" step="0.0001" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Source / who</label><input name="source" placeholder="e.g. Alex sheet" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Save</button>
+      </form>
+    </div>
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-3">Wastage % (applies to recipe-costed ingredients)</h2>
+      <form id="form-wastage" class="grid grid-cols-3 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
+        <div><label class="text-xs text-slate-500">Wastage %</label><input name="wastage_pct" type="number" step="0.01" placeholder="3" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Save</button>
+      </form>
+    </div>
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Code</th><th class="font-normal pb-2">Product</th>
+        <th class="font-normal pb-2">Ingredient</th><th class="font-normal pb-2">Packaging</th><th class="font-normal pb-2 text-right">Wastage</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>`);
+  attachShellHandlers();
+
+  el("form-cost").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const tier = f.get("tier");
+    await sb.from("product_costs").upsert({
+      product_code: f.get("product_code"),
+      cost_type: f.get("cost_type"),
+      tier: tier,
+      value: tier === "recipe" ? null : (parseFloat(f.get("value")) || 0),
+      source: tier === "confirmed" ? (f.get("source") || null) : null,
+      entered_by: tier === "placeholder" ? (f.get("source") || null) : null,
+      confirmed_by: null, confirmed_at: null,
+    }, { onConflict: "product_code,cost_type" });
+    renderCosts();
+  };
+  el("form-wastage").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("products").update({ wastage_pct: (parseFloat(f.get("wastage_pct")) || 0) / 100 }).eq("code", f.get("product_code"));
+    await loadAll(); renderCosts();
+  };
+  document.querySelectorAll("[data-promote]").forEach((b) => {
+    b.onclick = async () => {
+      const [code, type] = b.dataset.promote.split(":");
+      await sb.from("product_costs").update({ tier: "confirmed", confirmed_by: "app user", confirmed_at: new Date().toISOString() })
+        .eq("product_code", code).eq("cost_type", type);
+      renderCosts();
+    };
+  });
+}
+
+// ---------- Recipes tab ----------
+async function renderRecipes() {
+  const { data: lines } = await sb.from("recipe_lines").select("*, materials(description, uom_code)").order("product_code");
+  const rows = (lines || []).map((l) => {
+    const c = state.materialCosts[l.material_code];
+    const unitCost = c ? Number(c.cost_per_unit) : null;
+    return `<tr class="border-b border-slate-50 text-sm">
+    <td class="py-2">${l.product_code}</td>
+    <td class="py-2">${l.material_code} \u2014 ${l.materials?.description || ""}</td>
+    <td class="py-2 text-right">${l.quantity_per_batch} ${l.materials?.uom_code || ""}</td>
+    <td class="py-2 text-right">${unitCost === null ? `<span class="text-amber-700 text-xs">no purchase yet</span>` : money4(unitCost)}</td>
+    <td class="py-2 text-right">${unitCost === null ? "\u2014" : money(l.quantity_per_batch * unitCost)}</td>
+    <td class="py-2 text-right"><button data-del-recipe="${l.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+  </tr>`;
+  }).join("");
+
+  const productOpts = state.products.map((p) => `<option value="${p.code}">${p.code} \u2014 ${p.description}</option>`).join("");
+  const materialOpts = state.materials.map((m) => `<option value="${m.code}">${m.code} \u2014 ${m.description}</option>`).join("");
+
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-1">Add a recipe line</h2>
+      <p class="text-xs text-slate-500 mb-3">Quantity is per batch. For this to feed a product's cost, set that product's Ingredient or Packaging tier to "From recipe" on the Costs tab.</p>
+      <form id="form-recipe" class="grid grid-cols-4 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
+        <div><label class="text-xs text-slate-500">Material</label><select name="material_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
+        <div><label class="text-xs text-slate-500">Qty per batch</label><input name="quantity_per_batch" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
+      </form>
+    </div>
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Product</th><th class="font-normal pb-2">Material</th>
+        <th class="font-normal pb-2 text-right">Qty/batch</th><th class="font-normal pb-2 text-right">Cost/unit</th>
+        <th class="font-normal pb-2 text-right">Line cost</th><th></th>
+      </tr></thead><tbody>${rows || `<tr><td colspan="6" class="py-3 text-sm text-slate-400">No recipe lines yet.</td></tr>`}</tbody></table>
+    </div>`);
+  attachShellHandlers();
+
+  el("form-recipe").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("recipe_lines").insert({ product_code: f.get("product_code"), material_code: f.get("material_code"), quantity_per_batch: parseFloat(f.get("quantity_per_batch")) });
+    renderRecipes();
+  };
+  document.querySelectorAll("[data-del-recipe]").forEach((b) => {
+    b.onclick = async () => { await sb.from("recipe_lines").delete().eq("id", b.dataset.delRecipe); renderRecipes(); };
+  });
+}
+
+// ---------- Labour tab ----------
+async function renderLabour() {
+  const [{ data: periods }, { data: phases }, { data: outputs }] = await Promise.all([
+    sb.from("kilcoole_labour_periods").select("*").order("created_at", { ascending: false }),
+    sb.from("stillorgan_labour_phases").select("*").order("product_code"),
+    sb.from("stillorgan_expected_output").select("*"),
+  ]);
+
+  const kcProducts = state.products.filter((p) => p.site_id === "kilcoole");
+  const stProducts = state.products.filter((p) => p.site_id === "stillorgan");
+  const kcOpts = kcProducts.map((p) => `<option value="${p.code}">${p.code} \u2014 ${p.description}</option>`).join("");
+  const stOpts = stProducts.map((p) => `<option value="${p.code}">${p.code} \u2014 ${p.description}</option>`).join("");
+
+  const kcRows = (periods || []).map((r) => `<tr class="border-b border-slate-50 text-sm">
+    <td class="py-2">${r.product_code}</td><td class="py-2">${r.period_label}</td>
+    <td class="py-2 text-right">${r.quantity_produced.toLocaleString()}</td>
+    <td class="py-2 text-right">${money(r.total_labour_cost)}</td>
+    <td class="py-2 text-right font-medium">${money4(r.total_labour_cost / r.quantity_produced)}</td>
+    <td class="py-2 text-right"><button data-del-kc="${r.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+  </tr>`).join("");
+
+  const stRows = (phases || []).map((r) => `<tr class="border-b border-slate-50 text-sm">
+    <td class="py-2">${r.product_code}</td><td class="py-2">${r.phase_name}</td>
+    <td class="py-2 text-right">${r.hours}</td><td class="py-2 text-right">${money(r.rate_per_hour)}</td>
+    <td class="py-2 text-right">${money(r.hours * r.rate_per_hour)}</td>
+    <td class="py-2 text-right"><button data-del-st="${r.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+  </tr>`).join("");
+
+  const outRows = (outputs || []).map((r) => `<tr class="border-b border-slate-50 text-sm">
+    <td class="py-2">${r.product_code}</td><td class="py-2 text-right">${r.expected_output.toLocaleString()}</td>
+  </tr>`).join("");
+
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-1">Kilcoole \u2014 period labour</h2>
+      <p class="text-xs text-slate-500 mb-3">One product runs a whole period, so labour/unit is the period's total cost \u00f7 quantity produced. The most recent entry per product is the one used.</p>
+      <form id="form-kc" class="grid grid-cols-5 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${kcOpts || "<option value=''>No Kilcoole products</option>"}</select></div>
+        <div><label class="text-xs text-slate-500">Period</label><input name="period_label" placeholder="w/c 01/06/26" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Qty produced</label><input name="quantity_produced" type="number" step="1" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Total labour \u20ac</label><input name="total_labour_cost" type="number" step="0.01" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
+      </form>
+      <table class="w-full mt-4"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Product</th><th class="font-normal pb-2">Period</th><th class="font-normal pb-2 text-right">Qty</th>
+        <th class="font-normal pb-2 text-right">Total labour</th><th class="font-normal pb-2 text-right">\u20ac/unit</th><th></th>
+      </tr></thead><tbody>${kcRows || `<tr><td colspan="6" class="py-3 text-sm text-slate-400">Nothing yet.</td></tr>`}</tbody></table>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <h2 class="text-sm font-medium mb-1">Stillorgan \u2014 process phases</h2>
+      <p class="text-xs text-slate-500 mb-3">A day covers several products, so labour is built from phases and divided by expected output.</p>
+      <form id="form-st" class="grid grid-cols-5 gap-2 items-end mb-4">
+        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${stOpts || "<option value=''>No Stillorgan products</option>"}</select></div>
+        <div><label class="text-xs text-slate-500">Phase</label><input name="phase_name" placeholder="Mixing" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Hours</label><input name="hours" type="number" step="0.01" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Rate \u20ac/hr</label><input name="rate_per_hour" type="number" step="0.01" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add phase</button>
+      </form>
+      <table class="w-full mb-6"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Product</th><th class="font-normal pb-2">Phase</th><th class="font-normal pb-2 text-right">Hours</th>
+        <th class="font-normal pb-2 text-right">Rate</th><th class="font-normal pb-2 text-right">Cost</th><th></th>
+      </tr></thead><tbody>${stRows || `<tr><td colspan="6" class="py-3 text-sm text-slate-400">No phases yet.</td></tr>`}</tbody></table>
+
+      <h3 class="text-sm font-medium mb-2">Expected output per product</h3>
+      <form id="form-out" class="grid grid-cols-3 gap-2 items-end">
+        <div><label class="text-xs text-slate-500">Product</label><select name="product_code" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${stOpts || "<option value=''>No Stillorgan products</option>"}</select></div>
+        <div><label class="text-xs text-slate-500">Expected output (units)</label><input name="expected_output" type="number" step="1" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Save</button>
+      </form>
+      <table class="w-full mt-3"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Product</th><th class="font-normal pb-2 text-right">Expected output</th>
+      </tr></thead><tbody>${outRows || `<tr><td colspan="2" class="py-3 text-sm text-slate-400">Nothing yet.</td></tr>`}</tbody></table>
+    </div>`);
+  attachShellHandlers();
+
+  el("form-kc").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("kilcoole_labour_periods").insert({
+      product_code: f.get("product_code"), period_label: f.get("period_label"),
+      quantity_produced: parseFloat(f.get("quantity_produced")), total_labour_cost: parseFloat(f.get("total_labour_cost")),
+    });
+    renderLabour();
+  };
+  el("form-st").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("stillorgan_labour_phases").insert({
+      product_code: f.get("product_code"), phase_name: f.get("phase_name"),
+      hours: parseFloat(f.get("hours")), rate_per_hour: parseFloat(f.get("rate_per_hour")),
+    });
+    renderLabour();
+  };
+  el("form-out").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("stillorgan_expected_output").upsert({
+      product_code: f.get("product_code"), expected_output: parseFloat(f.get("expected_output")),
+    }, { onConflict: "product_code" });
+    renderLabour();
+  };
+  document.querySelectorAll("[data-del-kc]").forEach((b) => {
+    b.onclick = async () => { await sb.from("kilcoole_labour_periods").delete().eq("id", b.dataset.delKc); renderLabour(); };
+  });
+  document.querySelectorAll("[data-del-st]").forEach((b) => {
+    b.onclick = async () => { await sb.from("stillorgan_labour_phases").delete().eq("id", b.dataset.delSt); renderLabour(); };
+  });
+}
+
+// ---------- Settings tab: overheads, fixed costs, production days, storage ----------
+async function renderSettings() {
+  const [{ data: ohRows }, { data: fixedRows }, { data: daysRows }, { data: storage }] = await Promise.all([
+    sb.from("overhead_rates").select("*").order("site_id").order("cost_type"),
+    sb.from("fixed_costs").select("*").order("cost_item"),
+    sb.from("production_days_per_week").select("*"),
+    sb.from("storage_settings").select("*").single(),
+  ]);
+
+  const ohForMode = (ohRows || []).filter((r) => r.mode === state.mode);
+  const ohHtml = ohForMode.map((r) => `<tr class="border-b border-slate-50 text-sm">
+    <td class="py-2 capitalize">${r.site_id}</td><td class="py-2 capitalize">${r.cost_type}</td>
+    <td class="py-2 text-right"><input data-oh-cost="${r.site_id}:${r.cost_type}" type="number" step="0.01" value="${r.monthly_cost}" class="w-24 border border-slate-200 rounded px-1 py-0.5 text-right text-sm" /></td>
+    <td class="py-2 text-right"><input data-oh-units="${r.site_id}:${r.cost_type}" type="number" step="1" value="${r.avg_monthly_units}" class="w-24 border border-slate-200 rounded px-1 py-0.5 text-right text-sm" /></td>
+    <td class="py-2 text-right font-medium">${money4(r.avg_monthly_units ? r.monthly_cost / r.avg_monthly_units : 0)}</td>
+  </tr>`).join("");
+
+  const fixedHtml = (fixedRows || []).map((r) => `<tr class="border-b border-slate-50 text-sm">
+    <td class="py-2">${r.cost_item}</td>
+    <td class="py-2 text-right">${money(r.monthly_amount)}</td>
+    <td class="py-2 text-right">${pct(r.stillorgan_pct)}</td>
+    <td class="py-2 text-right">${pct(1 - r.stillorgan_pct)}</td>
+    <td class="py-2 text-right"><button data-del-fixed="${r.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+  </tr>`).join("");
+  const fixedTotal = (fixedRows || []).reduce((s, r) => s + Number(r.monthly_amount), 0);
+
+  const daysHtml = (daysRows || []).map((r) => `<tr class="border-b border-slate-50 text-sm">
+    <td class="py-2 capitalize">${r.site_id}</td>
+    <td class="py-2 text-right"><input data-days="${r.site_id}" type="number" step="0.5" value="${r.days}" class="w-20 border border-slate-200 rounded px-1 py-0.5 text-right text-sm" /></td>
+    <td class="py-2 text-right">${(r.days * 52 / 12).toFixed(1)}</td>
+  </tr>`).join("");
+
+  el("app").innerHTML = renderShell(`
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-1">Volume-based overheads \u2014 <span class="capitalize">${state.mode}</span> mode</h2>
+      <p class="text-xs text-slate-500 mb-3">Rate = monthly cost \u00f7 average monthly units produced. Switch mode with the toggle above to edit the other set.</p>
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Site</th><th class="font-normal pb-2">Cost</th>
+        <th class="font-normal pb-2 text-right">Monthly \u20ac</th><th class="font-normal pb-2 text-right">Avg monthly units</th>
+        <th class="font-normal pb-2 text-right">\u20ac/unit</th>
+      </tr></thead><tbody>${ohHtml}</tbody></table>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-1">Fixed costs</h2>
+      <p class="text-xs text-slate-500 mb-3">Spread by production days, not volume. Set each line's Stillorgan share \u2014 Kilcoole gets the rest.</p>
+      <form id="form-fixed" class="grid grid-cols-4 gap-2 items-end mb-4">
+        <div><label class="text-xs text-slate-500">Cost item</label><input name="cost_item" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Monthly \u20ac</label><input name="monthly_amount" type="number" step="0.01" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div><label class="text-xs text-slate-500">Stillorgan %</label><input name="stillorgan_pct" type="number" step="0.1" value="50" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
+      </form>
+      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+        <th class="font-normal pb-2">Item</th><th class="font-normal pb-2 text-right">Monthly</th>
+        <th class="font-normal pb-2 text-right">Stillorgan</th><th class="font-normal pb-2 text-right">Kilcoole</th><th></th>
+      </tr></thead><tbody>${fixedHtml || `<tr><td colspan="5" class="py-3 text-sm text-slate-400">Nothing yet.</td></tr>`}</tbody>
+      <tfoot><tr class="text-sm font-medium"><td class="pt-2">Total</td><td class="pt-2 text-right">${money(fixedTotal)}</td><td colspan="3"></td></tr></tfoot></table>
+    </div>
+
+    <div class="grid grid-cols-2 gap-6">
+      <div class="bg-white border border-slate-200 rounded-xl p-5">
+        <h2 class="text-sm font-medium mb-3">Production days per week</h2>
+        <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+          <th class="font-normal pb-2">Site</th><th class="font-normal pb-2 text-right">Days/week</th><th class="font-normal pb-2 text-right">Days/month</th>
+        </tr></thead><tbody>${daysHtml}</tbody></table>
+      </div>
+      <div class="bg-white border border-slate-200 rounded-xl p-5">
+        <h2 class="text-sm font-medium mb-1">Storage</h2>
+        <p class="text-xs text-slate-500 mb-3">Default \u20ac/unit, used unless a product has its own override.</p>
+        <input id="in-storage" type="number" step="0.0001" value="${storage?.default_rate || 0}" class="w-32 border border-slate-300 rounded-md px-2 py-1.5 text-sm" />
+      </div>
+    </div>`);
+  attachShellHandlers();
+
+  document.querySelectorAll("[data-oh-cost]").forEach((inp) => {
+    inp.onchange = async () => {
+      const [site, type] = inp.dataset.ohCost.split(":");
+      await sb.from("overhead_rates").update({ monthly_cost: parseFloat(inp.value) || 0 }).eq("site_id", site).eq("mode", state.mode).eq("cost_type", type);
+      renderSettings();
+    };
+  });
+  document.querySelectorAll("[data-oh-units]").forEach((inp) => {
+    inp.onchange = async () => {
+      const [site, type] = inp.dataset.ohUnits.split(":");
+      await sb.from("overhead_rates").update({ avg_monthly_units: parseFloat(inp.value) || 1 }).eq("site_id", site).eq("mode", state.mode).eq("cost_type", type);
+      renderSettings();
+    };
+  });
+  document.querySelectorAll("[data-days]").forEach((inp) => {
+    inp.onchange = async () => {
+      await sb.from("production_days_per_week").update({ days: parseFloat(inp.value) || 5 }).eq("site_id", inp.dataset.days);
+      renderSettings();
+    };
+  });
+  el("in-storage").onchange = async () => {
+    await sb.from("storage_settings").update({ default_rate: parseFloat(el("in-storage").value) || 0 }).eq("id", true);
+    renderSettings();
+  };
+  el("form-fixed").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await sb.from("fixed_costs").insert({
+      cost_item: f.get("cost_item"),
+      monthly_amount: parseFloat(f.get("monthly_amount")),
+      stillorgan_pct: (parseFloat(f.get("stillorgan_pct")) || 0) / 100,
+    });
+    renderSettings();
+  };
+  document.querySelectorAll("[data-del-fixed]").forEach((b) => {
+    b.onclick = async () => { await sb.from("fixed_costs").delete().eq("id", b.dataset.delFixed); renderSettings(); };
+  });
 }
 
 async function render() {
@@ -442,6 +957,11 @@ async function render() {
   else if (state.tab === "products") await renderProducts();
   else if (state.tab === "customers") await renderCustomers();
   else if (state.tab === "materials") await renderMaterials();
+  else if (state.tab === "purchases") await renderPurchases();
+  else if (state.tab === "costs") await renderCosts();
+  else if (state.tab === "recipes") await renderRecipes();
+  else if (state.tab === "labour") await renderLabour();
+  else if (state.tab === "settings") await renderSettings();
   attachShellHandlers();
 }
 
