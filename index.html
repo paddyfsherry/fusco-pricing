@@ -34,6 +34,7 @@ let state = {
   materialCosts: {},
   expandedMaterials: [],
   materialHistory: {},
+  recipeProduct: null,
   importTarget: "materials",
   importRows: null,
   importMsg: "",
@@ -139,17 +140,17 @@ async function costBuildUp(productCode) {
   const oh = {};
   (ohRows || []).forEach((r) => { oh[r.cost_type] = r.avg_monthly_units ? r.monthly_cost / r.avg_monthly_units : 0; });
 
-  // fixed overhead (day-based, real % split)
+  // fixed overhead: site's monthly allocation / site's average monthly units.
+  // Same volume basis as electricity, gas, cleaning and maintenance, so the
+  // answer doesn't shift depending on whether labour is logged weekly or monthly.
   const { data: fixedRows } = await sb.from("fixed_costs").select("*");
   let fixedAllocated = 0;
   (fixedRows || []).forEach((r) => {
     const sPct = r.stillorgan_pct ?? 0.5;
     fixedAllocated += r.monthly_amount * (site === "stillorgan" ? sPct : (1 - sPct));
   });
-  const { data: daysRow } = await sb.from("production_days_per_week").select("*").eq("site_id", site).single();
-  const daysPerMonth = (daysRow?.days || 5) * 52 / 12;
-  const dailyFixedRate = fixedAllocated / daysPerMonth;
-  const fixedOHPerUnit = unitsProduced ? dailyFixedRate / unitsProduced : 0;
+  const monthlyUnits = (ohRows || []).reduce((n, r) => n || r.avg_monthly_units, 0);
+  const fixedOHPerUnit = monthlyUnits ? fixedAllocated / monthlyUnits : 0;
 
   // storage
   const { data: storageSettings } = await sb.from("storage_settings").select("*").single();
@@ -763,49 +764,152 @@ async function renderCosts() {
 
 // ---------- Recipes tab ----------
 async function renderRecipes() {
-  const { data: lines } = await sb.from("recipe_lines").select("*, materials(description, uom_code)").order("product_code");
-  const rows = (lines || []).map((l) => {
+  // which products actually have a recipe
+  const { data: allLines } = await sb.from("recipe_lines").select("product_code, material_code");
+  const counts = {};
+  (allLines || []).forEach((l) => { counts[l.product_code] = (counts[l.product_code] || 0) + 1; });
+
+  if (!state.recipeProduct) {
+    const withRecipe = Object.keys(counts);
+    state.recipeProduct = withRecipe.length ? withRecipe.sort()[0] : (state.products[0] && state.products[0].code);
+  }
+  const code = state.recipeProduct;
+  const product = state.products.find((p) => p.code === code);
+
+  // this product's lines
+  const { data: lines } = await sb.from("recipe_lines")
+    .select("*, materials(description, uom_code)")
+    .eq("product_code", code)
+    .order("id");
+
+  // batch size, from whichever labour model applies
+  let batch = 0, batchNote = "";
+  if (product && product.site_id === "kilcoole") {
+    const { data: p } = await sb.from("kilcoole_labour_periods").select("*")
+      .eq("product_code", code).order("created_at", { ascending: false }).limit(1);
+    if (p && p.length) { batch = p[0].quantity_produced; batchNote = `from Kilcoole labour, ${p[0].period_label}`; }
+  } else {
+    const { data: o } = await sb.from("stillorgan_expected_output").select("*").eq("product_code", code).limit(1);
+    if (o && o.length) { batch = o[0].expected_output; batchNote = "from Stillorgan expected output"; }
+  }
+
+  const ing = [], pkg = [];
+  (lines || []).forEach((l) => {
     const c = state.materialCosts[l.material_code];
     const unitCost = c ? Number(c.cost_per_unit) : null;
-    return `<tr class="border-b border-slate-50 text-sm">
-    <td class="py-2">${l.product_code}</td>
-    <td class="py-2">${l.material_code} \u2014 ${l.materials?.description || ""}</td>
-    <td class="py-2 text-right">${l.quantity_per_batch} ${l.materials?.uom_code || ""}</td>
-    <td class="py-2 text-right">${unitCost === null ? `<span class="text-amber-700 text-xs">no purchase yet</span>` : money4(unitCost)}</td>
-    <td class="py-2 text-right">${unitCost === null ? "\u2014" : money(l.quantity_per_batch * unitCost)}</td>
-    <td class="py-2 text-right"><button data-del-recipe="${l.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
-  </tr>`;
-  }).join("");
+    const row = { ...l, unitCost, lineCost: unitCost === null ? null : l.quantity_per_batch * unitCost };
+    const isPkg = (state.materials.find((m) => m.code === l.material_code) || {}).uom_code === "each";
+    (isPkg ? pkg : ing).push(row);
+  });
+  const sum = (arr) => arr.reduce((s, r) => s + (r.lineCost || 0), 0);
+  const missing = (lines || []).filter((l) => !state.materialCosts[l.material_code]).length;
 
-  const productOpts = state.products.map((p) => `<option value="${p.code}">${p.code} \u2014 ${p.description}</option>`).join("");
-  const materialOpts = state.materials.map((m) => `<option value="${m.code}">${m.code} \u2014 ${m.description}</option>`).join("");
+  const section = (title, arr) => {
+    if (!arr.length) return "";
+    return `<tr><td colspan="6" class="pt-3 pb-1 text-xs font-medium text-slate-500">${title}</td></tr>` +
+      arr.map((l) => `<tr class="border-b border-slate-50 text-sm">
+        <td class="py-1.5">${l.material_code}</td>
+        <td class="py-1.5">${l.materials?.description || ""}</td>
+        <td class="py-1.5 text-right">
+          <input data-qty="${l.id}" type="number" step="0.0001" value="${l.quantity_per_batch}"
+                 class="w-24 border border-slate-200 rounded px-1 py-0.5 text-right text-sm" />
+          <span class="text-xs text-slate-400 ml-1">${l.materials?.uom_code || ""}</span>
+        </td>
+        <td class="py-1.5 text-right">${l.unitCost === null ? `<span class="text-amber-700 text-xs">no purchase</span>` : money4(l.unitCost)}</td>
+        <td class="py-1.5 text-right">${l.lineCost === null ? "\u2014" : money(l.lineCost)}</td>
+        <td class="py-1.5 text-right"><button data-del-recipe="${l.id}" class="text-xs text-slate-400 hover:text-red-600">remove</button></td>
+      </tr>`).join("");
+  };
+
+  const ingTotal = sum(ing), pkgTotal = sum(pkg), total = ingTotal + pkgTotal;
+  const perUnit = batch ? total / batch : null;
+  const price = product?.selling_price || 0;
+
+  const productOpts = state.products.map((p) =>
+    `<option value="${p.code}" ${p.code === code ? "selected" : ""}>${p.code} \u2014 ${p.description}${counts[p.code] ? ` (${counts[p.code]})` : ""}</option>`).join("");
+  const materialOpts = state.materials.map((m) =>
+    `<option value="${m.code}">${m.code} \u2014 ${m.description}${m.uom_code ? " (" + m.uom_code + ")" : ""}</option>`).join("");
 
   el("app").innerHTML = renderShell(`
     <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
-      <h2 class="text-sm font-medium mb-1">Add a recipe line</h2>
-      <p class="text-xs text-slate-500 mb-3">Quantity is per batch. For this to feed a product's cost, set that product's Ingredient or Packaging tier to "From recipe" on the Costs tab.</p>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs text-slate-500">Product</label>
+          <select id="sel-recipe-product" class="w-full mt-1 border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select>
+          <p class="text-xs text-slate-500 mt-1">The number in brackets is how many recipe lines that product already has.</p>
+        </div>
+        <div class="text-sm">
+          <p class="text-xs text-slate-500">Batch size</p>
+          <p class="font-medium">${batch ? `${batch.toLocaleString()} units` : `<span class="text-amber-700">not set</span>`}
+            <span class="text-xs text-slate-500 font-normal">${batchNote}</span></p>
+          <p class="text-xs text-slate-500 mt-1">${product?.site_id === "kilcoole"
+            ? "Set on the Labour tab, under Kilcoole period labour."
+            : "Set on the Labour tab, under Stillorgan expected output."}</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl p-5 mb-6">
+      <h2 class="text-sm font-medium mb-3">${product ? product.description : ""}</h2>
+      ${(lines || []).length ? `
+      <table class="w-full">
+        <thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
+          <th class="font-normal pb-2">Code</th><th class="font-normal pb-2">Material</th>
+          <th class="font-normal pb-2 text-right">Qty per batch</th>
+          <th class="font-normal pb-2 text-right">Cost/unit</th>
+          <th class="font-normal pb-2 text-right">Line cost</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${section("Ingredients", ing)}
+          ${ing.length ? `<tr class="text-sm"><td colspan="4" class="py-1 text-right text-slate-500">Ingredients per batch</td><td class="py-1 text-right font-medium">${money(ingTotal)}</td><td></td></tr>` : ""}
+          ${section("Packaging", pkg)}
+          ${pkg.length ? `<tr class="text-sm"><td colspan="4" class="py-1 text-right text-slate-500">Packaging per batch</td><td class="py-1 text-right font-medium">${money(pkgTotal)}</td><td></td></tr>` : ""}
+          <tr class="text-sm border-t border-slate-200">
+            <td colspan="4" class="py-2 text-right font-medium">Total per batch</td>
+            <td class="py-2 text-right font-medium">${money(total)}</td><td></td>
+          </tr>
+          ${batch ? `<tr class="text-sm">
+            <td colspan="4" class="py-1 text-right text-slate-500">Per unit (\u00f7 ${batch.toLocaleString()})</td>
+            <td class="py-1 text-right font-medium">${money4(perUnit)}</td><td></td></tr>
+            ${price ? `<tr class="text-sm"><td colspan="4" class="py-1 text-right text-slate-500">As a share of the \u20ac${price.toFixed(2)} selling price</td>
+            <td class="py-1 text-right ${perUnit / price > 0.6 ? "text-red-600" : "text-slate-700"}">${pct(perUnit / price)}</td><td></td></tr>` : ""}
+          ` : `<tr><td colspan="6" class="py-2 text-xs text-amber-700">Set a batch size to see the cost per unit.</td></tr>`}
+        </tbody>
+      </table>
+      ${missing ? `<p class="text-xs text-amber-700 mt-3">${missing} material${missing === 1 ? " has" : "s have"} no purchase recorded, so ${missing === 1 ? "its" : "their"} cost counts as zero here. Record a purchase on the Purchases tab.</p>` : ""}
+      ` : `<p class="text-sm text-slate-400">No recipe lines for this product yet.</p>`}
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-xl p-5">
+      <h2 class="text-sm font-medium mb-1">Add a material to this recipe</h2>
+      <p class="text-xs text-slate-500 mb-3">Quantity is per batch, in the material's own unit. For this to drive the product's cost, set its Ingredient or Packaging tier to "From recipe" on the Costs tab.</p>
       <form id="form-recipe" class="grid grid-cols-8 gap-2 items-end">
-        <div class="col-span-3"><label class="text-xs text-slate-500">Product</label><select name="product_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${productOpts}</select></div>
-        <div class="col-span-3"><label class="text-xs text-slate-500">Material</label><select name="material_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
-        <div><label class="text-xs text-slate-500">Qty per batch</label><input name="quantity_per_batch" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
+        <div class="col-span-5"><label class="text-xs text-slate-500">Material</label><select name="material_code" class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm">${materialOpts}</select></div>
+        <div class="col-span-2"><label class="text-xs text-slate-500">Qty per batch</label><input name="quantity_per_batch" type="number" step="0.0001" required class="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm" /></div>
         <button class="bg-slate-900 text-white rounded-md py-1.5 text-sm">Add</button>
       </form>
-    </div>
-    <div class="bg-white border border-slate-200 rounded-xl p-5">
-      <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
-        <th class="font-normal pb-2">Product</th><th class="font-normal pb-2">Material</th>
-        <th class="font-normal pb-2 text-right">Qty/batch</th><th class="font-normal pb-2 text-right">Cost/unit</th>
-        <th class="font-normal pb-2 text-right">Line cost</th><th></th>
-      </tr></thead><tbody>${rows || `<tr><td colspan="6" class="py-3 text-sm text-slate-400">No recipe lines yet.</td></tr>`}</tbody></table>
     </div>`);
   attachShellHandlers();
 
+  el("sel-recipe-product").onchange = (e) => { state.recipeProduct = e.target.value; renderRecipes(); };
   el("form-recipe").onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
-    await sb.from("recipe_lines").insert({ product_code: f.get("product_code"), material_code: f.get("material_code"), quantity_per_batch: parseFloat(f.get("quantity_per_batch")) });
+    await sb.from("recipe_lines").upsert({
+      product_code: code,
+      material_code: f.get("material_code"),
+      quantity_per_batch: parseFloat(f.get("quantity_per_batch")),
+    }, { onConflict: "product_code,material_code" });
     renderRecipes();
   };
+  document.querySelectorAll("[data-qty]").forEach((inp) => {
+    inp.onchange = async () => {
+      const v = parseFloat(inp.value);
+      if (isNaN(v) || v <= 0) { renderRecipes(); return; }
+      await sb.from("recipe_lines").update({ quantity_per_batch: v }).eq("id", inp.dataset.qty);
+      renderRecipes();
+    };
+  });
   document.querySelectorAll("[data-del-recipe]").forEach((b) => {
     b.onclick = async () => { await sb.from("recipe_lines").delete().eq("id", b.dataset.delRecipe); renderRecipes(); };
   });
@@ -982,7 +1086,8 @@ async function renderSettings() {
 
     <div class="grid grid-cols-2 gap-6">
       <div class="bg-white border border-slate-200 rounded-xl p-5">
-        <h2 class="text-sm font-medium mb-3">Production days per week</h2>
+        <h2 class="text-sm font-medium mb-1">Production days per week</h2>
+        <p class="text-xs text-slate-500 mb-3">Reference only \u2014 fixed overhead per unit is now monthly cost \u00f7 monthly units, the same basis as electricity and gas, so this no longer affects any cost.</p>
         <table class="w-full"><thead><tr class="text-left text-xs text-slate-500 border-b border-slate-100">
           <th class="font-normal pb-2">Site</th><th class="font-normal pb-2 text-right">Days/week</th><th class="font-normal pb-2 text-right">Days/month</th>
         </tr></thead><tbody>${daysHtml}</tbody></table>
